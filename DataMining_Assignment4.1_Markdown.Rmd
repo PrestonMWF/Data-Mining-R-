@@ -1,0 +1,178 @@
+---
+title: "Predicting Customer Credit Label using Classification Trees"
+author: "Mark Preston"
+date: "August 5, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Customer Creditability using German Credit Data
+
+As a continuation from the logistic regression prediction, I'll be using the German Credit data to predict whether a customer should labeled as good or bad from a credit perspective. However, this assignment will utilize classification trees for predictions instead. I've also carried over the same training and holdout from the previous work as well.
+
+```{r loading dat and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(caret)
+library(rattle)
+library(directlabels)
+library(rpart)
+library(knitr)
+library(kableExtra)
+
+#ggplot plotting theme preference
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+training <- read.csv("german_train.csv")
+factors <- training %>%
+  select(-1:-7) %>%
+  map_df(as.factor)
+
+training <- training %>%
+  select(1:7) %>%
+  bind_cols(factors)
+
+holdout <- read.csv("german_holdout.csv")
+factors <- holdout %>%
+  select(-1:-7) %>%
+  map_df(as.factor)
+
+holdout <- holdout %>%
+  select(1:7) %>%
+  bind_cols(factors)
+```
+
+***
+
+###Build a Classification Tree to predict Class on the training set
+
+Below, I've developed the initial classification tree. The tree control parameters are set so the tree grows to full size (complexity parameter of zero) with terminal nodes that have at least thirty observations (minsplit = 30). Additionally, the model has 10-fold cross validation.
+
+```{r developing classification tree}
+set.seed(1017)
+
+tree_params <- rpart.control(cp = 0, minsplit = 30, xval = 10)
+
+credit_tree <- rpart(Class ~., data = training, control = tree_params)
+```
+
+
+***
+
+###Evaluate the complexity parameter plots and print out. Prune tree using cp value corresponding to the lowest xerror
+
+The `plotcp` function returns the model's complexity parameter, relative error, and size of tree. Here, I'm looking for the lowest x error value and the corresponding complexity, which is then used to prune the initial tree. With this in mind, it looks like the complexity parameter will be around .02.
+
+```{r reviewing tree parameters plot}
+plotcp(credit_tree)
+```
+
+The complexity parameter table confirms the visualization. The lowest x error is associated with a cp of about .02. This value will be carried forward to prune the tree.  
+
+```{r reviewing tree parameters table}
+cp_table <- as.data.frame(credit_tree$cptable) %>%
+  arrange(xerror)
+
+cp_table %>%
+  custom_kable()
+```
+
+Using the `prune` function, I've taken the complexity parameter from the previous table and reduced the tree. With this done, the final model for the training set is ready to review.
+
+```{r developing pruned tree}
+set.seed(1017)
+
+credit_pruned <- prune(tree = credit_tree, cp = cp_table$CP[1])
+
+printcp(credit_pruned)
+```
+
+Before the formal prediction, there is an interesting inclusion in the tree object. The model has a variable importance rating. Essentially, a high score outlines the information loss associated with the variable if it was dropped. Prior to looking at the actual tree, this provides a very good indicator of what feature is driving the prediction results.
+
+As the plot shows, there are six variables included in the final model from the intial 20. It also essentially outlines that if the data could be best described with one variable, it would be account balance. Intuitively, I think this makes sense given there would be an expectation that customers with good creditablility have an upstanding account balance. While I haven't plotted the tree itself, this shows account balance is very likely the main node. A quick scan of the other variables also show variables I would associate with being a good customer, like the value of their savings.
+
+```{r variable importance plot}
+tree_importance <- as.data.frame(credit_pruned$variable.importance) %>%
+  rownames_to_column(var = "tree_vars") %>%
+  rename(importance = "credit_pruned$variable.importance")
+
+tree_importance %>%
+  mutate(tree_vars = reorder(tree_vars, importance),
+         variable_importance = c(rep("in model", 6), rep("not included", 7))) %>%
+  ggplot(aes(tree_vars, importance, fill = variable_importance)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Pruned classification tree variable importance",
+       subtitle = "Highlighted variables were all includes in model- six total features",
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+***
+
+###Develop a confusion matrix for the training set using the pruned tree
+
+The pruned model shows about 79% accuracy on the intial training data. Perhaps equally important given the bank's desire for high sensitivity, the model shows about 79% here. Overall, the main accuracy metrics are very balanced, which is a good trait. However, trees are prone to overfitting so the holdout accuracy review will be more illuminating.
+
+```{r training tree confusion matrix}
+training <- training %>%
+  mutate(tree_pred = predict(object = credit_pruned, 
+                              newdata = training, 
+                              type = "class"))
+
+confusionMatrix(training$Class, training$tree_pred)
+```
+
+
+####Can you observe any signifigant tree interactions? Does the tree look useful?
+
+The tree plot confirms the variable importance plot showing account balance as the initial node. Any account balance of 3 or 4 (higher balances essentially) are classified as being good customers; this split yields an 87% accuracy, which is quite high even in comparison to the intitial 70% of customers being good. Additionally, the main split accounts for about 46% of the training cases, or 322 customers.
+
+Generally, the terminal nodes outside of the first emanating from account balance are much smaller. Node 16 (bottom far left) shows only about 30 customers, given the minimum split, but has about 93% accuracy when categorizing bad customers. This can be seen given the zero over the accruacy and group size metrics. The interaction stems from low account balance, less than 12 months duration, low savings, and finally less than 48 months duration. Again, this seems intuitive given it classifies customers without savings taking on short-term loans as being bad.  
+
+```{r visualizing pruned tree, fig.height=7.5}
+fancyRpartPlot(credit_pruned, 
+               type = 2,
+               cex = .83,
+               main = "Rpart classification tree for German Credit Customers")
+```
+
+***
+
+###Perform holdout validation using a confusion matrix
+
+After viewing the main interactions, I've developed a conufsion matrix to see how the pruned tree predictions. Unfortunately, there's a noticable drop off in prediction accuracy (79% to 70%). On top of this, the sensitivity has declined by about 22% from training to holdout. This is a sign that the model overfits the training data and as such, does not perform well on an unseen set. There's an expecation that accuracy declines some amount from train to holdout but, this seems too large. Overall, the declines signal model instability. 
+
+```{r holdout tree confusion matrix- high accuracy}
+holdout <- holdout %>%
+  mutate(tree_pred = predict(object = credit_pruned, 
+                              newdata = holdout, 
+                              type = "class"))
+
+confusionMatrix(holdout$Class, holdout$tree_pred)
+
+#write.csv(holdout[,22], "tree_preds.csv", row.names = F)
+#write.csv(training[,22], "tree_train_pred.csv", row.names = F)
+```
+
+***
+
+###Summarize the results. Did the logistic regression or classification tree perform better on the German Credit data?
+
+When comparing both methods, I think the logistic model provided better predictions given its range of balanced accuracy metrics. The tree model showed signs of overfitting, which is common for the method but, hurts its usefulness for predictions. Additionally, the bank expressed an interest in having a model with high sensitivty, which is another knock against the tree model.
+
+Overall, I think the logistic model is preferable but, I do like the transparency and visual simplicity of the tree. While logistic models are reasonably interpretable, working with log odds isn't always straightforward. This is especially true when trying to describe results to a non-technical stakeholder. As such, I think the tree model has better interpretability and presentation value. However, the main component of the assignment is predictive power and not inferential work, so my choice is the logistic model.
+
+***

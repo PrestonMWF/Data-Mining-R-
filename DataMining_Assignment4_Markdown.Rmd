@@ -1,0 +1,375 @@
+---
+title: "Predicting Customer Credit Label using Logistic Regression"
+author: "Mark Preston"
+date: "August 5, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+##Customer Creditability using German Credit Data
+
+This week, I’ll be using the German Credit data to predict whether a customer should labeled as good or bad from a credit perspective.
+
+```{r loading data and packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(directlabels)
+library(gains)
+library(knitr)
+library(kableExtra)
+
+#ggplot plotting theme preference
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+german_credit <- read.csv("German.Credit.csv")
+```
+
+
+###Generate a training (70%) and hold out (30%) set
+
+Before splitting the original set into training and test (holdout), I've done some naming and variable type updates. I wanted to shorten some of the variable names so they aren't lengthy when printed. Additionally, many of the variables listed as integers are actually categorical, so I've made that change as well.
+
+```{r transformations and data split}
+german_credit <- german_credit %>%
+  rename(Class = Creditability,
+         Duration = Duration.of.Credit..month.,
+         Age = Age..years.,
+         Amount = Credit.Amount,
+         Rate = Instalment.per.cent,
+         Residence_Yrs = Duration.in.Current.address,
+         Employ_Length = Length.of.current.employment,
+         Previous_Credit_Pay = Payment.Status.of.Previous.Credit)
+
+factors <- german_credit %>%
+  select(-Class, -Duration, -Age, -Amount, -Rate, 
+         -Residence_Yrs, -No.of.Credits.at.this.Bank, -No.of.dependents) %>%
+  map_df(as.character)
+
+german_credit <- german_credit %>%
+  select(Duration, Age, Amount, Rate, 
+         Residence_Yrs, No.of.Credits.at.this.Bank, No.of.dependents, Class) %>%
+  bind_cols(factors)
+
+set.seed(1017)
+data_split <- createDataPartition(y = german_credit$Class, p = .7, list = F)
+
+training <- german_credit %>%
+  slice(data_split)
+
+holdout <- german_credit %>%
+  slice(-data_split)
+
+#write.csv(training, "german_train.csv", row.names = F)
+#write.csv(holdout, "german_holdout.csv", row.names = F)
+```
+
+***
+
+###Develop a logistic regression model with the lowest AIC to predict customer class. Choose only main effects.
+
+As a starting point, I developed a model with all the available predictors. This allows a first glimpse at what variables might be important to carry forward in subsequent models while also highlighting how certain features affect credit class. As seen, there are seven significant variables. The initial model also shows a good fit with the residual deviance well below null and also close to equal with degrees of freedom (general rule of within bounds of 2 * sqrt(651) +- deviance). Overall, this is a good starting fit.
+
+```{r logistic model development}
+credit_glm <- glm(as.factor(Class) ~., family = binomial, data = training)
+
+summary(credit_glm)
+```
+
+In an attempt to find the lowest AIC, I've made a model containing only significant predictors from the full composition. This reduces AIC from 706.93 to 697.08, which is an improvement. Additionally, the residual deviance is improved here as well.
+
+```{r logistic with signifigant predictors from full model}
+sig_glm <- glm(as.factor(Class) ~ Duration + Rate + Account.Balance + 
+                 Previous_Credit_Pay +
+                 Purpose + Value.Savings.Stocks + Employ_Length, 
+               family = binomial(link = logit), data = training)
+
+c(manual_glm_aic = sig_glm$aic) %>%
+  custom_kable()
+```
+
+I wanted to see if a more formal approach would yield a lower AIC though. With this in mind, I used the `step` function and reduced the initial, full model to the lowest AIC. Here, I developed a model with a 690.46 AIC, which is the lowest value I could find. Comparing it to the manual version I created, it contains age, number of credits at the bank, sex & marital status as well as telephone; all of these looked non-significant in the full model.
+
+I've provided a high-level review of each significant predictor coefficients below:
+
+####Duration
+
+- Lower credit duration is associated with a good customer
+
+####Rate
+
+- Lower rates are associated with good customers
+
+####Account Balance
+
+- Having a higher account balance is associated with being a good customer (level 4 being the most money in an account has the largest coefficient)
+
+####Previous Credit History
+
+- Having a more complete and upstanding credit history is associated with good customers
+
+####Purpose
+
+- Not all levels are significant
+
+- Credit used for new and used cars, furniture/equipment, and other purposes are positively associated with being a good customer
+
+####Values in Savings and Stocks
+
+- Having larger savings and stocks is associated with good customers
+
+####Employment Length
+
+- Having longer, stable employment is associated with good customers
+
+- However, the longest employment length does not have the largest positive log odds (.95 vs 1.43 for length level 3)
+
+Overall, this model shows good fit, the lowest AIC I could develop, and is an improvement on previous iterations. As a bonus, these predictors seem intuitive from a business perspective so it would be easier to communicate the findings to a non-technical audience.
+
+```{r low aic logistic model}
+step_glm <- step(credit_glm, trace = F)
+
+summary(step_glm)
+```
+
+
+***
+
+###Generate a confusion matrix for the training data using the lowest AIC model. Do you like the model? 
+
+Moving into the second phase of the analysis, I'm starting by reviewing the class predictions when compared to the actuals using a confusion matrix. The print out shows the model has 79.3% accuracy when classifying customers. There's more to unpack here aside from the accuracy though.
+
+For one, the model does better with good customers. This can be derived by looking at the specificity (about 82%) which highlights 446 correct predictions and 100 misses (type I errors, or false negatives). Conversely, the model is less accurate when classifying bad customers as seen by a 71% sensitivity. The data dictionary outlines that the bank considers it worse to classify a customer as good when they are bad (false positive) 
+than it is to classify a customer as bad when they are good (false negative). The midway point between these metrics (sensitivity + specificity / 2) is the balanced accuracy, which is about 76% here.
+
+Overall, I think this is a good starting point. I like the model because it has a fairly high accuracy and balanced accuracy making it useful from a predictive standpoint. Additionally, it has clear inferential value from a knowledge standpoint as seen in the previous section. 
+
+```{r training confusion matrix}
+training <- training %>%
+  mutate(class_prob = as.numeric(predict(step_glm, 
+                                         newdata = training, 
+                                         type = "response")),
+         class_pred = ifelse(class_prob > .5, 1, 0))
+
+confusionMatrix(training$Class, training$class_pred)
+
+#write.csv(training[,23], "logistic_train_pred.csv")
+```
+
+***
+
+###Perform hold out validation using confusion matrix, lift charts, and AUROC curves. Do you like the results?
+
+To further validate the model's usefulness, I'll be testing it on an unseen hold out sample. Additionally, I've developed a function called `decision_boundary` to help with selecting which probability cut off should be used for classifying customers. In the training model classification, I simply used a .5 boundary, meaning if a customer had a greater 50% probability, they were marked as good. 
+
+While this seems intuitive, the .5 threshold doesn't necessarily provide the highest accuracy. Moreover, if the bank has specific business instructions to avoid type II errors, this threshold is probably too high. If the goal is to be more permissive by erring on the side of classifying a customer as good when they are actually bad, this boundary should be lower. The function collects all the main accuracy metrics for a specific probability boundary so they can be reviewed in concert. 
+
+```{r decision boundary function development}
+decision_boundary <- function(model, prob, data){
+  suppressWarnings(
+    results <- data %>%
+      mutate(Class = data$Class,
+             class_prob = predict.glm(model, newdata = data, type = "response"),
+             class_pred = ifelse(class_prob > prob, 1, 0))
+  )
+  
+  conf_mat <- confusionMatrix(results$Class, results$class_pred)
+  accuracy <- conf_mat$overall[1]
+  
+  sens <- sensitivity(as.factor(results$Class), as.factor(results$class_pred))
+  spec <- specificity(as.factor(results$Class), as.factor(results$class_pred))
+  balance <- (sens + spec) / 2
+  
+  neg_pred <- negPredValue(as.factor(results$Class), as.factor(results$class_pred))
+  pos_pred <- posPredValue(as.factor(results$Class), as.factor(results$class_pred))
+  
+  return(list(accuracy = accuracy,
+              sensitivity = sens, 
+              specificity = spec,
+              balanced = balance,
+              neg_pred = neg_pred,
+              pos_pred = pos_pred))
+}
+```
+
+Below, I've put together the results for decision boundary probabilities from .1 to .9. As seen, I can now look at six accuracy metrics for both the training and hold out set. 
+
+```{r decision boundary df creation}
+decision_probs <- as.data.frame(t(
+  sapply(seq(0.1, .9, .01), function(x) decision_boundary(model = step_glm, 
+                                                          prob = x,
+                                                          data = training))))
+decision_probs <- decision_probs %>%
+  bind_rows(
+    as.data.frame(t(
+      sapply(seq(0.1, .9, .01), function(x) decision_boundary(model = step_glm, 
+                                                              prob = x,
+                                                              data = holdout)))))
+
+decision_probs <- decision_probs %>%
+  map_df(unlist) %>%
+  mutate(decision_prob = rep(seq(.1, .9, .01), 2),
+         set = c(rep("train", 81), rep("holdout", 81)),
+         set = factor(set, levels = c("train", "holdout"))) %>%
+  select(set, decision_prob, everything())
+
+head(decision_probs, 3) %>%
+  bind_rows(
+    tail(decision_probs, 3)) %>%
+  custom_kable()
+```
+
+I'm going to hold off on using a confusion matrix right away so I can pick an appropriate decision probability first. Starting with this, I've put together an accuracy plot for training and hold out. It's a good sign that there doesn't seem to be too much of an accuracy drop between the sets. Any major difference would be a sign the model might be overfit. For train, the highest accuracy (~80%) comes from a .51 decision boundary but, there are several values between .42 and .52 that provide nearly equal results (79% accuracy). The hold out boundary with the highest accuracy (about 77%) can be found at .46 and .47. However, in both sets these different boundaries inherently produce different accuracy metrics and, given the bank is interested in finding a high sensitivity, they need to be considered too. 
+
+```{r training and test accuracy with different probs}
+decision_probs %>%
+  ggplot(aes(decision_prob, accuracy, colour = set)) +
+  geom_line(size = 1.3, show.legend = F) +
+  geom_dl(aes(label = set), 
+          method = list(dl.trans(x = x - .2), "first.points")) +
+  scale_x_continuous(breaks = seq(0, 1, .05), expand = c(.08, 0, 0.01, 0)) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Classification accuracy based on differing probability decision boundary for train and holdout",
+       subtitle = "Both sets show similar curve shapes with different maximums at seperate decision percentages",
+       y = NULL,
+       caption = "Source: German Credit Data")
+```
+
+Switching focus to the hold out exclusively, all six hold out metrics can be found below with different decision boundaries. I like this visualization approach because the various decision boundary trade-offs can be evaluated simultaneously. As mentioned, the highest accuracy boundaries can be found just below .5 but, at these levels, the sensitivity begins to drop. Choosing the highest accuracy therefore means accepting a slightly higher false positive rate.
+
+At this juncture, it would be important to consult with business stakeholders on these options. There's a reasonable nexus around .31 or .32 where the main four metrics are nearly congruent. With this choice, accuracy drops to about 73% but, there is an even balance of class predictions (i.e. sensitivity and specificity are close to equal).
+
+```{r test set accuracy metric review}
+decision_probs %>%
+  filter(set == "holdout") %>%
+  gather(key = "accuracy_metric", value = "values", -decision_prob, -set) %>%
+  ggplot(aes(decision_prob, values, colour = accuracy_metric)) +
+  geom_line(size = 1.3, alpha = .6) +
+  geom_vline(xintercept = 0.46, size = 1.3, alpha = .3, colour = "darkgray") +
+  annotate(geom = "rect", alpha = .2, fill = "darkgray",
+           xmin = .46, xmax = .47, 
+           ymin = 0, ymax = 1) +
+  geom_vline(xintercept = 0.47, size = 1.3, alpha = .3, colour = "darkgray") +
+  scale_x_continuous(breaks = seq(0, 1, .05), expand = c(.02, 0, 0.02, 0)) +
+  scale_y_continuous(breaks = seq(0, 1, .1), expand = c(0, 0, 0, 0)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Classification test accuracy metrics based on differing probability decision boundary",
+       subtitle = "Highest accuracy (~77%) comes from boundary cut off at .46 & .47 (shaded gray area)",
+       y = NULL,
+       caption = "Source: German Credit Data")
+```
+
+This metric equality can be seen in the training set as well where the main four indicators intersect at about .38.
+
+```{r training test set accuracy metric review}
+decision_probs %>%
+  select(-neg_pred, -pos_pred) %>%
+  gather(key = "accuracy_metric", value = "values", -decision_prob, -set) %>%
+  ggplot(aes(decision_prob, values, colour = accuracy_metric)) +
+  geom_line(size = 1.3, alpha = .6) +
+  facet_wrap(facets = "set", ncol = 1) +
+  scale_y_continuous(breaks = seq(0, 1, .15)) +
+  scale_x_continuous(breaks = seq(0, 1, .15)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Classification accuracy metrics based on differing probability decision boundary for train and holdout",
+       subtitle = "Both sets show interesting nexus where all four metrics align- occurs below .45 boundary",
+       y = NULL,
+       caption = "Source: German Credit Data")
+```
+
+Following this decision boundary probability review, I've decided to show how the highest accuracy and the balanced metrics option looks. As seen, the model does well on the hold out set with nearly 77% accuracy. It's positive to only see a small drop in accuracy from the training set, which shows the model doesn't have much over or underfitting.
+
+```{r confusion matrix for hold out with high accuracy}
+holdout <- holdout %>%
+  mutate(class_prob = as.numeric(predict(step_glm, 
+                                         newdata = holdout, type = "response")),
+         high_accuracy = as.integer(ifelse(class_prob > .47, 1, 0)),
+         even_metrics = as.integer(ifelse(class_prob > .32, 1, 0)))
+
+confusionMatrix(holdout$Class, holdout$high_accuracy)
+
+#write.csv(holdout[,24], "logistic_preds.csv", row.names = F)
+```
+
+As previously discussed, the more even approach has lower accuracy but, only 8 customers are classified as good when they are in fact not. Again, this would be an ideal time to review the results with business stakeholders and evaluate if this trade-off was worthwhile. My intuition here is that the high sensitivity is preferable at the expense of a slightly lower accuracy.
+
+```{r confusion matrix for hold out with even metrics}
+confusionMatrix(holdout$Class, holdout$even_metrics)
+```
+
+As seen, the table shows that 93% of the predictions in the top decile (10) were correct. This is good and shows the model does well when predicting high probabilities. The chart also shows a small drawback in the model given mean response does not continually decrease (small rise from 5o to 60 before eventually falling). While this isn't ideal, the overall effect is still gradually decreasing, which is important. This chart suggests the model does well at predicting throughout different probability deciles. As a  
+
+```{r lift chart}
+credit_lift <-  gains(actual =  holdout$Class, 
+                      predicted = holdout$class_prob, 
+                      groups = 10)
+
+as.data.frame(unlist(credit_lift)) %>%
+  rownames_to_column(var = "element") %>%
+  slice(-111:-114)  %>%
+  rename(values = "unlist(credit_lift)") %>%
+  mutate(row = rep(1:10, 11),
+         values = as.character(values),
+         values = round(as.numeric(values), 2),
+         element = gsub(pattern = "([0-9]+)", replacement = "", x = element),
+         element = factor(element, levels = names(credit_lift)[1:11])) %>%
+  spread(key = "element", value = "values") %>%
+  select(-row, -min.prediction, -max.prediction) %>%
+  custom_kable()
+```
+
+The lift chart really highlights this trend as well. As seen, all the metrics decline steadily, save for some minor aberrations. Interestingly, the model still predicts about 33% of good credit customers in the highest depth (100) which highlights the classes are unbalanced (in favour of good credit customers, or ones).
+
+```{r lift plot}
+lift_df <- data.frame(
+  depth = credit_lift$depth,
+  mean_response = credit_lift$mean.resp,
+  cume_mean = credit_lift$cume.mean.resp,
+  mean_predicted = credit_lift$mean.prediction
+)
+
+lift_df %>%
+  gather(key = "metric", value = "mean_responses", -depth) %>%
+  ggplot(aes(depth, mean_responses, colour = metric)) +
+  geom_line(size = 1.3, show.legend = F) +
+  geom_dl(aes(label = metric), 
+          method = list(dl.trans(x = x + .2), "last.points")) +
+  scale_x_continuous(breaks = seq(0, 100, 20), expand = c(.02, 0, 0.17, 0)) +
+  labs(title = "Lift plot for hold out data- all metrics gradually decreasing",
+       subtitle = "Even in depth of 100, model has about 33% good credit predictions- points to unbalanced classes (more ones than zeros)",
+       caption = "Source: German Credit Data")
+```
+
+As a final step, I've plotted the model AUROC. This highlights the model's trade off between sensitivity and specificity (or type I vs type II errors). the purple line essentially highlights a random 50-50 guess. Ideally, the blue line should be well separated above the guess line, which is evident here. With a .739 AUC (area under the curve), the model is about halfway to the max (1) which further supports it being strong. Overall, these final metrics validate that this model is useful.
+
+```{r AUCROC plot, message=FALSE, warning=FALSE}
+library(AUC)
+roc_df <- data.frame(roc(predictions = holdout$class_prob, 
+                    labels = as.factor(holdout$Class))[2],
+                    roc(predictions = holdout$class_prob, 
+                    labels = as.factor(holdout$Class))[3])
+
+credit_auc <- round(auc(roc(holdout$class_prob, as.factor(holdout$Class))), 3)
+
+roc_df %>%
+  ggplot(aes(fpr, tpr)) +
+  geom_line(size = 1.3, colour = "dodgerblue2") +
+  geom_abline(intercept = 0, slope = 1, size = 1.3, alpha = .5, colour = "darkorchid3") +
+  scale_x_continuous(breaks = seq(0, 1, .2), expand = c(.03, 0, 0, .03)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), expand = c(.03, 0, 0, .03)) +
+  labs(title = paste0("ROC curve for German Credit GLM: AUC= ", credit_auc),
+       y = "sensitivity (true positive rate)",
+       x = "1 - specificity (false positive rate)",
+       caption = "Source: German Credit Data")
+```
+
+***
