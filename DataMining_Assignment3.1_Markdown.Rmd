@@ -1,0 +1,354 @@
+---
+title: "German Credit Principle Components Analysis (PCA)"
+author: "Mark Preston"
+date: "July 22, 2018"
+output: 
+  html_document: 
+    fig_height: 7
+    fig_width: 10
+---
+
+***
+
+##PCA with German Credit
+
+Beginning the analysis, I've loaded the assignment data and relevant R packages. Additionally, I developed a custom function, `custom_kable`, that is useful for constructing aesthetically pleasing charts. Further, I also set my `ggplot2` theme to bw, which is my preference. With that done, I have all the building blocks to begin the analysis.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+
+data("GermanCredit")
+
+#setting ggplot preference
+theme_set(
+  theme_bw()
+)
+
+#creating custom table function
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+  kable_styling(bootstrap_options = "striped")
+}
+```
+
+One transformation that can be done right away is removing any categorical variables. PCA is based on linear algebra and as such, only works with numeric features. This includes only the first seven variables from the German credit set.
+
+```{r numeric variable selection}
+data.frame(type = sapply(GermanCredit, typeof)) %>%
+  rownames_to_column(var = "variable") %>%
+  filter(type == "integer" & variable != "Class") %>%
+  custom_kable()
+
+german_pca <- GermanCredit %>%
+  select(Duration, Age, Amount, InstallmentRatePercentage, 
+         ResidenceDuration, NumberExistingCredits, NumberPeopleMaintenance)
+```
+
+I've worked with these seven variable for market segmentation clustering so I'm pretty familiar with the set. That said, I've visualized the features below to do a quick review of their composition. The four bottom plots are more akin to binned, ordinal features. Number of people maintenance also only has two values (1 and 2) and as such, will be dropped. As an additional rationalization, it doesn't seem to have any business relevance so I can safely remove it. 
+
+```{r pca set visualization}
+german_pca %>%
+  gather(key = "variable", value = "values") %>%
+  ggplot(aes(values, fill = variable)) +
+  geom_histogram(bins = 33, show.legend = F) +
+  facet_wrap(facets = "variable", scales = "free", nrow = 2) +
+  labs(title = "PCA data for German Credit- includes only numeric variables",
+       y = NULL,
+       x = NULL,
+       caption = "Source: German Credit Data")
+
+german_pca <- german_pca %>%
+  select(-NumberPeopleMaintenance) %>%
+  rename(Rate = InstallmentRatePercentage,
+         Residence_yrs = ResidenceDuration,
+         Credits = NumberExistingCredits)
+```
+
+***
+
+###Split the data into training (70%) and testing (30%)
+
+Before conducting PCA, I've split the data into a training and test set so the analysis can be verified using a hold out sample. The test set will be used for a prediction task in a later section. 
+
+PCA, like k-means clustering, can be dominated by the presence of variables with very large scale (like amount here). As such, I've scaled and centred the both train and test, which effectively makes the values z-scores.
+
+```{r train and test split}
+set.seed(1017)
+data_split <- sample(x = nrow(german_pca), size = 700, replace = F)
+
+training <- german_pca %>%
+  slice(data_split)
+
+testing <- german_pca %>%
+  slice(-data_split) %>%
+  mutate(Duration = (Duration - mean(training$Duration)) / sd(training$Duration),
+         Age = (Age - mean(training$Age)) / sd(training$Age),
+         Amount = (Amount - mean(training$Amount)) / sd(training$Amount),
+         Rate = (Rate - mean(training$Rate)) / sd(training$Rate),
+         Residence_yrs = (Residence_yrs - mean(training$Residence_yrs)) / sd(training$Residence_yrs),
+         Credits = (Credits - mean(training$Credits)) / sd(training$Credits))
+
+training <- as.data.frame(scale(training, center = T, scale = T))
+```
+
+***
+
+###Perform PCA on the German Credit training set
+
+Developing the pca objects can be done with the `princomp` function. This model object will be the main focus for the analysis.
+
+```{r conducting pca for german credit}
+credit_pca <- princomp(x = training)
+```
+
+***
+
+###Generate scree plot and select number of components to retain
+
+Using the pca model, I've extracted the factors which are used to determine how much variance each factor explains. Using linear algebra terminology, these are a vector of eigenvalues. These values, or factors, are essentially all the information from the original data set distilled into six values. They come ordered so the largest factor is first with decreasing importance thereafter. Each can be reviewed for how much variance it explains by dividing the eigenvalue squared by the sum of all factors squared.
+
+The variance explanations can then be charted in a scree plot, as seen below. Factor one captures about 28% of information from the German credit variables. This is fairly low for the largest factor. However, the first five factors capture similar amounts of information. It really isn't until factor five that the variance explanation becomes much weaker. This elbow highlights that factor six can be dropped, which means the five I'll keep explain about 95% of the information found in the set.
+
+There's one pca limitation here. Despite having condensed the set, there's about a 5% information loss. Practically speaking, this might just be noise uncaptured by the other factors but, there could be useful signal in factor six. However, there is still a large amount captured so it should be okay moving forward. It's worth noting though because this is one of the method's trade-offs.
+
+Another point to consider here is the elbow at factor five. There's a smaller, though noticeable, elbow at factor two (drop of 6% vs 7% at five). However, I felt with only 51% of information captured by one and two, it was more appropriate to select five. Five doesn't reduce the set very much so again, there's a trade-off.
+
+```{r pca scree plot}
+pca_scree <- data.frame(dev = credit_pca$sdev ^ 2) %>%
+  rownames_to_column(var = "PC") %>%
+  mutate(variance_exp = round(dev / (sum(dev)), 2),
+         vaf = cumsum(variance_exp),
+         PC = str_replace(string = PC, pattern = "Comp.", replacement = "PCA"))
+
+pca_scree %>%
+  mutate(vaf_line = "line") %>%
+  ggplot(aes(PC, vaf, group = vaf_line, label = paste0(vaf * 100,"%"))) +
+  geom_line(colour = "royalblue2", size = 1.3) +
+  geom_label(hjust = .3, nudge_x = 0.15, nudge_y = -.035) +
+  geom_vline(xintercept = 5, size = 1.3, colour = "darkorange") +
+  scale_y_continuous(breaks = seq(0, 1, .1)) +
+  labs(title = "PCA scree plot- Components show similiar variance explanations in first",
+       subtitle = "Plot indicates that choosing 5 principle components is reasonable (elbow at orange line)",
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+***
+
+###Plot component loadings. Interpret and name the factors
+
+The table below highlights the pca loadings, which can be used for naming the factors. More formally, it's an eigenvector matrix. These values provide the first opportunity to explore how the factors are related to the original variables as well. For example, PCA1 shows high values for both duration and amount, which indicates this factor captures information about long, high value banking credits. I'll explore the other factors throughout this section culminating with each being named.
+
+```{r reviewing pca loadings}
+credit_loadings <- as.data.frame(credit_pca$loadings[,1:5]) %>%
+  rownames_to_column(var = "variable")
+
+names(credit_loadings) <- gsub(pattern = "Comp.", 
+                               replacement = "PCA", 
+                               x = names(credit_loadings))
+
+credit_loadings %>%
+  custom_kable()
+```
+
+The assignment suggests visualizing pca one loadings versus the other loadings for naming the factors, which can be seen below. That said, I think it's busy and slightly difficult to interpret the interaction between pca 1 and other loadings. Some insights stick out, such as rate being the highest in pca three. However, I'll use other visualization options to finalize namings.
+
+```{r pca faceted dot plot}
+credit_loadings %>%
+  gather(key = "pca", value = "pca_loadings", -variable, -PCA1) %>%
+  ggplot(aes(PCA1, pca_loadings, colour = variable, label = variable)) +
+  geom_point(size = 6, alpha = .8) +
+  facet_wrap(facets = "pca") +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1)) +
+  scale_y_continuous(breaks = seq(-1, 1, .25)) +
+  geom_hline(yintercept = 0, size = 1.3, alpha = .3, colour = "darkgray") +
+  labs(title = "PC1 versus the other four factor loadings",
+       caption = "Source: German Credit Data")
+```
+
+I have two preferred visualization options for displaying the loadings. The first is a line plot showing the interaction between all the factor loadings across each input variable. While undoubtedly busy, it allows each variable's corresponding factor loading to be observed at one time. The reason I like this option is because it highlights where the extremes are for each level. As an example, it's very clear that components 1, 3, and 4 capture little information for age while pca 5 and 2 represent young customers respectively (old age isn't really picked up in any component). For amount, pca one captures information on large credit amounts being drawn by clients. By going through each variable, the factor loadings reveal what information the components hold.
+
+```{r pca loadings line plot}
+credit_loadings %>%
+  gather(key = "pca", value = "pca_loadings", -variable) %>%
+  ggplot(aes(variable, pca_loadings, colour = pca, group = pca)) +
+  geom_line(size = 1.3, alpha = .3) +
+  geom_hline(yintercept = 0, alpha = .5, size = 1.3, colour = "darkgray") +
+  scale_y_continuous(breaks = seq(-1, 1, .2)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Factor loadings for principle components- Plot highlights interaction between loading levels",
+       subtitle = "Example: PCA 2 and 5 both capture younger clients",
+       y = "pca loadings",
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+To avoid the overplotted effect of the line interacting, my second choice is a faceted plot with each component's factor loadings. While it lacks the noticeable variable interactions from the previous plot, the loadings for each factor are much clearer, which makes this well suited for the final naming. I think the loadings are all clear and interpretable here with each factor having at least one major variable where it captures a lot of information. With that in mind, here are the principle component names I've devised:
+
+####PCA 1:
+
+- High amount, long duration
+
+####PCA 2:
+
+- New, young customer
+
+####PCA 3:
+
+- Medium duration, high rate 
+
+####PCA 4:
+
+- Established customer, existing credits
+
+####PCA 5:
+
+- Young, residence stable
+
+```{r pca loadings bar chart}
+credit_loadings %>%
+  gather(key = "pca", value = "pca_loadings", -variable) %>%
+  ggplot(aes(variable, pca_loadings, fill = pca)) +
+  geom_col(show.legend = F) +
+  facet_wrap(facets = "pca", nrow = 1) +
+  geom_hline(yintercept = 0, alpha = .5, size = 1.3, colour = "darkgray") +
+  scale_y_continuous(breaks = seq(-1, 1, .2)) +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Faceted bar charts for factor loadings from each principle component",
+       subtitle = "Plot highlights loadings to be used for factor naming; For example, PCA 4 captures information for customers with numerous credits",
+       y = "pca loadings",
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+***
+
+###Show that component factor scores and loadings are orthogonal
+
+Let's start with a quick review of what orthogonality means. The pca method is driven by eigenvalue decomposition, as the specific case involving a square, symmetric matrix (the covariance matrix here), and single value decomposition as the general case. At a high level, the output are the factors (eigenvalues) and factor loadings (eigenvectors) from the matrix decomposition. What makes this special is that the decomposition process strips out any redundant information captured by more than one column in the set. The result is orthogonality, which means that each resulting eigenvector contains non-redundant information and is independent. The factor scores, derived from multiplying the eigenvector matrix with the centred data frame (i.e. each column's mean subtracted), are also orthogonal.
+
+Building on the linear algebra base, this orthogonality can be shown using some common matrix operations. Given that each column should be independent, this means that there shouldn't be any correlation between the factor score features. Below, I've constructed a correlation plot which aptly highlights this. As the colour scale indicates, a column is shown as white when it has zero correlation to another feature. The absence of any blue or red shows how the new factor score matrix is uncorrelated and thus, orthogonal.
+
+```{r orthogonal testing- factors scores}
+corplot <- cor(credit_pca$scores[,-6])
+
+corrplot.mixed(corplot,
+               title = "Correlation plot for PCA Scores \n Output shows no correlations demonstrating orthogonality", 
+               mar = c(0, 0, 2, 0))
+```
+
+For the loadings, I'm using a second method to demonstrate orthogonality. When a matrix has columns that are independent, their dot products should be zero (both columns multiplied and then added). Taking this a step further, if the loadings matrix is multiplied by itself, which in effect takes all the column dot products at once, the output should be the identity matrix (all elements are zero except for ones on the diagonal). The matrix is 6 x 5, so to do a self-multiplication, the first input has to be transposed. As the resulting 5 x 5 matrix below highlights, this matrix operation does produce an identity matrix, which demonstrates orthogonality (and more specifically, orthonormality here). 
+
+```{r orthogonal testing- factors loadings}
+t(as.matrix(credit_loadings[,-1])) %*% as.matrix(credit_loadings[,-1]) %>%
+  custom_kable()
+```
+
+###Perform holdout validation of PCA solution
+
+To validate the pca solution, I'll use the model to create a manual test set which can be compared to the original one I developed in a previous section. To do so, I've used the `predict` function on the original test data and then multiplied it by the pca loadings thereby developing new, manual factor scores.
+
+```{r pca holdout validation}
+test_predictions <- as.data.frame(predict(object = credit_pca, newdata = testing))
+
+test_predictions <- data.frame(
+  as.matrix(test_predictions[,-6]) %*% t(credit_pca$loadings[,-6]))
+
+head(test_predictions, 6) %>%
+  custom_kable()
+```
+
+To check how similar the scores are, I'm using a correlation between both sets. The diagonals signal how strong the association between each set is. Here, it's evident that the manual and actual test set are very close with correlations ranging from .88 to essentially 1. This is a strong indication that the split is reasonable.
+
+```{r manual vs actual test correlation check}
+cor(as.vector(test_predictions), as.vector(testing)) ^ 2 %>%
+  custom_kable()
+```
+
+As a final check, the variance account for between the actual and manual test set can be derived. With an R2 of .95, the sets are very closely associated providing further verification of the set split. 
+
+```{r test vs manual R2}
+c(testing_R2 = 1 - sum((test_predictions - testing) ^ 2) / sum((testing - colMeans(testing)) ^ 2)) %>%
+  round(2) %>%
+  custom_kable()
+```
+
+***
+
+###Rotate component loadings
+
+Below, I'm rotating the original pca loadings using `varimax`.
+
+```{r rotating copmponent loadings}
+credit_rotate <- varimax(credit_pca$loadings[,-6])
+```
+
+In lieu of visualizing loadings from component one against two and three, I've developed a faceted line plot which allows for a comparison of components from both the original and rotated loadings at the same time. The rotation effects are noticeable, especially in component two where the new loadings are completely changed. It now only contains information about residence duration with the other variables at around zero. Components one and three are the most similar while four and five each have one major departure but, are otherwise congruent. The names I previously created would change here, for two, four, and five; As a commonality, these components now only have one major variable being represented with the other peaks being muted. In several cases, rotation seems to accentuate the strongest loadings while reducing any secondary values.
+
+This maybe shouldn't be surprising though given the model includes five components and the analysis began with six variables. A quick review of the rotated components shows pca one represents a mix of amount and duration but, the others capture the information for one specific variable:
+
+- **PCA 2**: Residence Years
+
+- **PCA 3**: Rate
+
+- **PCA 4**: Credits
+
+- **PCA 5**: Age
+
+```{r rotated loadings versus originals}
+loadings_compare <- as.data.frame(credit_rotate$loadings[,1:5]) %>%
+  rownames_to_column(var = "variable") %>%
+  mutate(loading = "rotated")
+
+names(loadings_compare) <- gsub(pattern = "Comp.", 
+                               replacement = "PCA", 
+                               x = names(loadings_compare))
+
+credit_loadings %>% 
+  mutate(loading = "original") %>%
+  bind_rows(loadings_compare) %>%
+  gather(key = "pca", value = "pca_loadings", -variable, -loading) %>%
+  ggplot(aes(variable, pca_loadings, colour = loading, group = loading)) +
+  geom_line(size = 1.3, alpha = .6) +
+  facet_wrap(facets = "pca", nrow = 1) +
+  geom_hline(yintercept = 0, alpha = .5, size = 1.3, colour = "darkgray") +
+  scale_y_continuous(breaks = seq(-1, 1, .2)) +
+  scale_color_manual(values = c("dodgerblue2", "darkorange")) +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Faceted line plot for original and rotated factor loadings",
+       subtitle = "PCA 2 has very different loadings with rotation- many secondary loading characteristics from original set seem muted",
+       y = "pca loadings",
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+
+***
+
+###Comment on the PCA Model. Do you like the solution? 
+
+I started to build this case in the previous section but, the solution doesn't seem useful here. One of the main purposes of pca is dimensional reduction and moving from six variables to five doesn't seem worthwhile. Granted, there was a smaller, though noticeable, elbow at two components. However, I didn't think choosing two components that accounted for only 51% of variance made sense.
+
+I think one of the main reasons the pca solution doesn't do well here is because the input variables have little correlation to begin with. PCA produces orthogonal, and uncorrelated, components which works especially well on a set with high multi-collinearity where similar information can be condensed into a few factors. A few of the variables being used are ordinal integers so low correlation makes sense contextually.
+
+Highlighting this, a correlation matrix for the initial input variables shows little association between variables, save for duration and amount. This might shed light on why both these variables were captured by the same component in the rotated loadings (one) while the others were more independent.  
+
+Overall, I don't think pca is appropriate for this set given it didn't provide any useful dimensional reduction. Much of this might be attributable to the input variables, which show little correlation to begin with.  
+
+```{r original correlattion matrix}
+corplot <- german_pca %>%
+  rename(Res. = Residence_yrs) %>%
+  cor()
+
+corrplot.mixed(corplot,
+               title = "Correlation plot for Original, Unscaled German Credit set \n Output shows few associations, save for amount and duration", 
+               mar = c(0, 0, 3, 0))
+```
+
+***
