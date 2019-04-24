@@ -1,0 +1,225 @@
+---
+title: "Predicting Creditability with LDA and Ensemble Methods"
+author: "Mark Preston"
+date: "August 19, 2018"
+output: html_document
+---
+
+***
+
+##Using Linear Discriminant Analysis on German Credit Data
+
+For this assignment, I'll be using both linear and quadratic discriminant models to classify banking customers as creditworthy or not. I'll be using the same data from the logistic regression assignment.
+
+```{r loading dat and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(MASS)
+library(caret)
+library(knitr)
+library(kableExtra)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+selectd <- dplyr::select
+
+training <- read.csv("german_train.csv")
+factors <- training %>%
+  selectd(-1:-7) %>%
+  map_df(as.factor)
+
+training <- training %>%
+  selectd(1:7) %>%
+  bind_cols(factors)
+
+holdout <- read.csv("german_holdout.csv")
+factors <- holdout %>%
+  selectd(-1:-7) %>%
+  map_df(as.factor)
+
+holdout <- holdout %>%
+  selectd(1:7) %>%
+  bind_cols(factors)
+```
+
+***
+
+###Build LDA and QDA models to predict Class
+
+Below, I've used both the `lda` and `qda` functions from the MASS package to develop models.
+
+```{r lda and qda development}
+credit_lda <- lda(Class ~., data = training)
+
+credit_qda <- qda(Class ~., data = training)
+```
+
+To assess how well each model classifies, I'll start by assessing predictions made on the training set. The confusion matrix below highlights an initial accuracy of about 80%. Another important metric here is sensitivity given the bank outlined a preference for avoiding Type I errors- here, it stands at about 71%. At first glance, these are comparable to the logistic regression metrics.  
+
+```{r lda confusion matrix}
+confusionMatrix(training$Class, 
+                unlist(predict(credit_lda, newdata = training, type = "class")[1]))
+```
+
+The quadratic model shows a 6% accuracy increase to 86%. Sensitivity only goes up by about 2% which means that most of the increased accuracy comes from more accurate classifications for good customers (Type II error reduction or less false negatives). Right now, the qda solution appears to be preferable but, hold out is necessary to validate this result.
+
+```{r qda confusion matrix}
+confusionMatrix(training$Class, 
+                unlist(predict(credit_qda, newdata = training, type = "class")[1]))
+```
+
+***
+
+###Perform holdout for both models
+
+I've put together a new data frame for the prediction results, which will be used for the ensemble results in the next section. For now though, I'm conducting holdout validation for the lda and qda models.
+
+The lda confusion matrix shows a big accuracy drop from about 80 to 73%. Moreover, the holdout sensitivity is only 58%, which is very low. The accuracy metrics drop off signals that the model doesn't generalize to new data well.
+
+```{r lda holdout validation}
+test_results <- holdout %>%
+  selectd(Class) %>%
+  mutate(lda_pred = unlist(predict(credit_lda, newdata = holdout, type = "class")[1]),
+         qda_pred = unlist(predict(credit_qda, newdata = holdout, type = "class")[1]))
+
+confusionMatrix(test_results$Class, test_results$lda_pred)
+```
+
+The prediction results for the qda are also disappointing. The accuracy dropped about 15% from training to holdout. Similarly, the sensitivity falls to 53%, which isn't good enough. Neither of these appear to be stable from training to holdout, though the lda model seems to show less of a decline.
+
+```{r qda holdout validation}
+confusionMatrix(test_results$Class, test_results$qda_pred)
+```
+
+***
+
+###Build and ensemble model with logistic, tree, lda, and qda classifications
+
+To create an ensemble model, I've loaded the predictions from previous assignments for logistic regression and tree models. With these, I can put together a voting classifier to make an ensemble model.
+
+```{r ensemble model creation}
+tree_test <- read.csv("tree_preds.csv")
+tree_train <- read.csv("tree_train_pred.csv")
+
+logistic_test <- read.csv("logistic_preds.csv")
+logistic_train <- read.csv("logistic_train_pred.csv")
+
+train_results <- training %>%
+  selectd(Class) %>%
+  mutate(lda_train = unlist(predict(credit_lda, 
+                                               newdata = training, type = "class")[1]),
+         qda_train = unlist(predict(credit_qda, 
+                                                newdata = training, type = "class")[1]),
+         logistic_train = logistic_train$class_pred,
+         tree_train = tree_train$x)
+
+test_results <- test_results %>%
+  mutate(tree_test = tree_test$x,
+         logistic_test = logistic_test$even_metrics)
+
+head(test_results) %>%
+  custom_kable()
+```
+
+To do so, I need to take the majority classification across the four models. Additionally, in the event of a tie, a random class has to be assigned. I've developed an approach that takes the sum of the rows and, given the total is over two, the class is one. When the sum is equal to two, a random choice is made using `rbinom`.
+
+```{r ensemble function}
+test_results <- test_results %>%
+  map_df(as.numeric) %>%
+  mutate(Class = Class - 1,
+         lda_pred = lda_pred - 1,
+         qda_pred = qda_pred - 1)
+
+set.seed(1017)
+test_results <- test_results %>%
+  mutate(row_sum = apply(test_results[,-1], 1, sum),
+         ensemble = ifelse(row_sum < 2, 0, 1),
+         ensemble = ifelse(row_sum == 2, rbinom(22, 1, .5), ensemble))
+
+train_results <- train_results %>%
+  map_df(as.numeric) %>%
+  mutate(Class = Class - 1,
+         lda_train = lda_train - 1,
+         qda_train = qda_train - 1)
+
+set.seed(1017)
+train_results <- train_results %>%
+  mutate(row_sum = apply(train_results[,-1], 1, sum),
+         ensemble = ifelse(row_sum < 2, 0, 1),
+         ensemble = ifelse(row_sum == 2, rbinom(42, 1, .5), ensemble))
+```
+
+Just to ensure the random assignment worked, I've made a table to review the new ensemble classes. The results appear fine without any obvious issues. That said, the records assigned to one are greater than zero, which in this case is probably helpful for accuracy. Overall, this random assignment will impact the accuracy metrics though.
+
+```{r shwoing random 1s and 0s}
+train_random <- train_results %>%
+  filter(row_sum == 2) %>%
+  count(ensemble)
+
+test_random <- test_results %>%
+  filter(row_sum == 2) %>%
+  count(ensemble)
+
+bind_rows(train_random, test_random) %>%
+  mutate(set = rep(c("training", "holdout"), each = 2)) %>%
+  selectd(set, everything()) %>%
+  custom_kable()
+```
+
+The training ensemble shows a promising 81% accuracy with about 76% sensitivity. Some of the models showed signs of overfitting though so this should be taken with some caution.
+
+```{r ensemble train review}
+confusionMatrix(train_results$Class, train_results$ensemble)
+```
+
+When evaluating the holdout ensemble, the accuracy and sensitivity both fall. In fact, a few of the stand alone models seems to outperform the group voting option. I think this implies that at times the majority vote is overriding a minority classification that happens to be correct. The added majority voting and complexity do not add any predictive power here so I wouldn't carry the ensemble forward. It didn't do as well as I had hoped but, given a few of the models comprising the ensemble had hit or miss results, this shouldn't be surprising. 
+
+```{r ensemble test review}
+confusionMatrix(test_results$Class, test_results$ensemble)
+```
+
+***
+
+###Which model yielded the best results? Which had the best predictions for bad customers?
+
+When assessing the holdout accuracy from each model, the linear discriminant option was the highest by a very small margin (73%). That said, it only provides an .3% accuracy over the logistic model so the choice is essentially even.
+
+```{r overall model review}
+model_accuracy <- data.frame(
+  logistic = confusionMatrix(test_results$Class, 
+                             test_results$logistic_test)$overall[1],
+  tree = confusionMatrix(test_results$Class, 
+                             test_results$tree_test)$overall[1],
+  lda = confusionMatrix(test_results$Class, 
+                             test_results$lda_pred)$overall[1],
+  qda = confusionMatrix(test_results$Class, 
+                             test_results$qda_pred)$overall[1]
+)
+
+model_accuracy %>%
+  custom_kable()
+```
+
+Accuracy isn't everything here though. As I've stated throughout the assignments, the bank is interested in retaining high sensitivity alongside accuracy. Using this metric, the logistic model is by far the most preferable. Since it ranks tied for first in accuracy and has 10% higher sensitivity over the lda model, I would recommend using the logistic model for the creditability classification. The bank also retains the option to work with different decision boundaries making it a flexible choice. Further, the logistic option is one of the more explainable models so the findings would be easier to communicate to a non-technical audience. Given this, I would put forward this model as my final choice. 
+
+```{r overall model review 2}
+model_sensitivty <- data.frame(
+  row.names = "Sensitivty",
+  logistic = sensitivity(as.factor(test_results$Class),
+                         as.factor(test_results$logistic_test)),
+  tree = sensitivity(as.factor(test_results$Class),
+                         as.factor(test_results$tree_test)),
+  lda = sensitivity(as.factor(test_results$Class),
+                         as.factor(test_results$lda_pred)),
+  qda = sensitivity(as.factor(test_results$Class),
+                         as.factor(test_results$qda_pred))
+)
+
+model_sensitivty %>%
+  custom_kable()
+```
+
+***
