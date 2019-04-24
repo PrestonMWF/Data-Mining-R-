@@ -1,0 +1,434 @@
+---
+title: "Latent Class Analysis (LCA) for Market Segmentation"
+author: "Mark Preston"
+date: "July 22, 2018"
+output: 
+  html_document: 
+    fig_height: 7
+    fig_width: 10
+---
+
+***
+
+##German Credit LCA
+
+Building on previous clustering work, this week I'll be using Latent Class Analysis, or LCA, to work on the German Credit data. Specifically, the aim will be performing some customer segmentation with categorical variables.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(poLCA)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+#ggplot plotting theme preference
+theme_set(
+  theme_bw()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+#MASS covers up dplyr `select` so giving it another name
+selectd <- dplyr::select
+
+german_credit <- read.csv("German.Credit.csv")
+```
+
+Prior to the LCA, the segmentation variables need to be selected. When reviewing the variable types in the set, they are all integers. This is because the categorical variables are all coded with integers. Given this, I consulted the data dictionary to assist with selection. Additionally, I dropped all the numeric variables from the clustering exercise and the creditability variable, which is used as the outcome variable for any classification modelling.
+
+```{r variable types for LCA}
+data.frame(type = apply(german_credit, 2, typeof)) %>%
+  rownames_to_column(var = "variable") %>%
+  custom_kable()
+
+category_set <- german_credit %>%
+  selectd(-Age..years., -Credit.Amount, -Instalment.per.cent, 
+         -Duration.of.Credit..month., -Duration.in.Current.address,
+         -No.of.Credits.at.this.Bank, -No.of.dependents, -Creditability)
+```
+
+This leaves 14 variables to choose from. Class interpretation here will be important so 14 seems like too many, so I'll work to reduce that number to a more manageable selection. To pick out any features with little variation or skewed counts, I've compiled a table with each variable level count. After reviewing all the levels, I'm choosing to drop four additional variables. As mentioned, these all have unbalanced counts or or even (like Telephone). Most of these don't look useful for any business purpose either so that makes it even more appropriate.  
+
+```{r variable selection for LCA 2}
+category_set %>%
+  gather(key = "variables") %>%
+  group_by(variables) %>%
+  count(value) %>%
+  custom_kable()
+
+lca_set <- category_set %>%
+  selectd(-Foreign.Worker, -Guarantors, -Telephone, -Type.of.apartment)
+```
+
+With nine remaining variables, the set is almost ready but, could use some more transformation. I'm dropping concurrent credit mostly because it's hard to interpret in the data dictionary. Adding more rationale, it's also unbalanced. I'm also electing to drop purpose because there are so many levels (10) and the items are fairly homogeneous (mostly household items like cars, radios, and televisions). With ten levels, the class inclusion probabilities become very diffuse which hinders interpretation. Finally, I've dropped savings value since the set already includes data on customer checking accounts and most valuable asset.
+
+I'll stick with the remaining variables because they all have clear business interpretations and cater to banking needs. They include a range of personal as well as financial features, which is ideal for market segmentation (the driving force behind the analysis). 
+
+As another more methodological note, having a few more variables here is probably good because of how LCA works. I'm trying to find latent, or hidden, classes in the data, which essentially means variables that might not be represented in the set. If the set was reduced to only two variables, for example, there's not a lot of extra information to derive. This might limit the hidden classes that were findable thus hindering the analysis. However, I think six is a large enough number that a few latent classes might exist. This also frames that the ideal number of classes is likely far smaller than six. As a guess, somewhere between two and four classes seems reasonable but, this can be verified using AIC and BIC going forward.
+
+Before proceeding, I've also re-leveled both credit payment history and purpose because they include zeros, which the `poLCA` function will not accept. Purpose also had a level with all zeros (credit for vacations) so I re-order the numbers. The final LCA set contains six variables.
+
+```{r variable selection for LCA 3}
+lca_set <- lca_set %>%
+  selectd(-Concurrent.Credits, -Value.Savings.Stocks, -Purpose) %>%
+  rename(Credit_History = Payment.Status.of.Previous.Credit) %>%
+  mutate(Credit_History = Credit_History + 1)
+```
+
+I've quickly looked at the variable levels but, with the set finalized, I'll delve into them further. Each level represented a binned category. For example, account balance values are a mix of below zero or less than 200 Deutsche Marks (DM, dating the set before the Euro's introduction), greater than 200 DM, and no checking account. It's hard to situate when this set was collected based on the amounts but, in essence, this provides some level of customer wealth. The variable indicates this is generally a set with lower savings clients. 
+
+Building on this, here is the largest variable level for each feature:
+
+#####Credit History
+
+- All credits to this bank paid pack duly
+
+#####Current Employment Length
+
+- Between one and four years
+
+#####Most Valuable Asset
+
+- Car or other (excluding property, insurance, or building savings agreement)
+
+#####Occupation
+
+- Skilled employee
+
+#####Sex and Marital Status
+
+- Single male
+
+- As a note, there are 310 women, none of which are single (about 70/30 gender split)
+
+```{r LCA variable visualization}
+lca_set %>%
+  gather(key = "variables") %>%
+  ggplot(aes(value, fill = variables)) +
+  geom_bar(show.legend = F) +
+  facet_wrap(facets = "variables", scales = "free", nrow = 2) +
+  scale_x_continuous(breaks = seq(1, 10, 1)) +
+  labs(title = "Bar charts for LCA variables- Levels are mixed with some skewed features",
+       y = "count",
+       x = "variable level",
+       caption = "Source: German Credit Data")
+```
+
+A composite customer sketch starts coming together with a review like this. The bank clientele are mostly single males with low asset holdings and checking balances that have been reliable in paying off previous credits. This is important because LCA is designed to extract hidden features amongst these customers so it's good to profile and understand the set characteristics before the formal modelling. 
+
+***
+
+###Determine the LCA class solution. Justify choice using AIC and LCA graphs.
+
+I've split the data into a training and test set so the most appropriate LCA model can be verified using a hold out sample. This is done by using the class conditional probabilities from the training set to develop the test classes clusters and then, comparing the results for consistency. Here, I'll do a review of AIC, BIC, and class predictions to provide assurances that the model selection is stable and statistically sound.
+
+```{r training and test split}
+set.seed(1017)
+data_split <- sample(x = nrow(lca_set), size = 700, replace = F)
+
+training <- lca_set %>%
+  slice(data_split)
+
+testing <- lca_set %>%
+  slice(-data_split)
+```
+
+Similar to k-means, there's an approach to choosing the appropriate LCA class. This involves looking at AIC and BIC, which provide a metric for relative model importance. For example, if only one LCA model was created, the AIC and BIC are not useful given both metrics are used for comparison; they are not absolute. Given this, I've created LCA models for two to seven classes. From there, I'll use AIC and BIC to judge which one is the most appropriate.
+
+To streamline this process, I've developed a helper function to collect the LCA model components I need for analysis. `lca_collect` runs the model for a given class size for both train and test while also saving AIC, BIC, and prediction class size. Since the modelling requires a formula, I've also put that together too. There isn't an outcome variable so the y is just a 1 (as in regressions with no predictors, one is used as a no-term stand in value).
+
+```{r LCA model development}
+lca_formula <- cbind(Account.Balance, Credit_History, 
+                     Occupation, Length.of.current.employment,
+                     Sex...Marital.Status, Most.valuable.available.asset) ~ 1
+
+lca_collect <- function(return, lca_formula, train, test, lca_n, seed){
+  set.seed(seed = seed)
+  train_lca <- poLCA(formula = lca_formula, data = train, nclass = lca_n,
+                         nrep = 10, tol = .001, verbose = FALSE)
+  
+  set.seed(seed = seed)
+  test_lca <- poLCA(formula = lca_formula, data = test, nclass = lca_n,
+                    nrep = 10, tol = .001, verbose = FALSE, probs.start = train_lca$probs)
+  
+  aic_bic <- data.frame(classes = lca_n,
+                    train_aic = round(train_lca$aic, 3),
+                    test_aic = round(test_lca$aic, 3),
+                    train_bic = round(train_lca$bic, 3),
+                    test_bic = round(test_lca$bic, 3))
+  
+  train_size <- train_lca$predclass
+  test_size <- test_lca$predclass
+  
+  if (return == "aic") {return(aic_bic)}
+  if (return == "class") {return(list(train = train_size, test = test_size))}
+  if (return != "aic" | return != "class") {
+    stop("Value specified is not part of function- Call either aic or class")}
+}
+```
+
+I'll start with the AIC and BIC collection. Each LCA model's AIC and BIC are gathered simultaneously using the helper function. I've developed models for 2 to 7 classes, which should be generous on the upper bound.
+
+The table below seems to show three classes as being appropriate. This is just intuition but, it seems like that's where the added information levels out (i.e. the elbow). I outlined that my intuition would be towards a lower class size given there are only six input variables, so three seems reasonable. From a stability standpoint, the train and test values progressing similarly is a good thing.
+
+```{r aic and bic collection}
+aic_compare <- as.data.frame(
+  t(sapply(2:7, function(x) lca_collect(return = "aic", 
+                                        lca_formula = lca_formula, 
+                                        train = training, 
+                                        test = testing, 
+                                        lca_n = x, 
+                                        seed = 1017))))
+
+aic_compare <- aic_compare %>%
+  map_df(unlist)
+
+aic_compare %>%
+  custom_kable()
+```
+
+Verifying these with a visualization furthers this initial assessment. Both the training and test metrics show elbow breaks at 3 classes. This means that the added variance accounted for by the additional classes may not provide any extra value when weighed against the additional complexity. As such, I'll select a three class model going forward.
+
+```{r aic and bic visualization}
+aic_compare %>%
+  gather(key = "metric", value = "values", -classes) %>%
+  arrange(desc(metric)) %>%
+  mutate(metric = factor(metric, levels = c("train_aic", "train_bic",
+                                            "test_aic", "test_bic")),
+         set_marker = c(rep("train", 12), rep("test", 12)),
+         set_marker = factor(set_marker, levels = c("train", "test"))) %>%
+  ggplot(aes(classes, values, colour = metric)) +
+  geom_line(size = 1.7) +
+  facet_grid(facets = "set_marker", scales = "free_y") +
+  geom_vline(xintercept = 3, colour = "dodgerblue2", size = 1.3, alpha = .7) +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  labs(title = "Train and test set AIC/BIC metrics plot",
+       y = "AIC/BIC",
+       subtitle = "AIC & BIC lines show same elbow feature for class selection (blue line at 3)",
+       caption = "Source: German Credit Data")
+```
+
+Before moving onto the final model selection though, I'm going to look at train and test class predictions for consistency. While AIC and BIC were similar in test and train, the actual class sizes highlight if there is stability between the model splits. This provides another check to see if the train and test split is reasonable. As the plot below highlights, the class sizes are generally consistent across train and test models. The model with seven classes looks almost non-linear but otherwise, the split looks reasonable. This provides further evidence that the train and test models are sound.
+
+```{r visualize train and test class sizes, warning=FALSE}
+lca_size <- sapply(2:7, function(x) lca_collect(return = "class", 
+                                                lca_formula = lca_formula, 
+                                                train = training, 
+                                                test = testing, 
+                                                lca_n = x, 
+                                                seed = 1017))
+
+comparison_df <- data.frame(
+  set = rep("train", 700),
+  CL2 = unlist(lca_size[1]),
+  CL3 = unlist(lca_size[3]),
+  CL4 = unlist(lca_size[5]),
+  CL5 = unlist(lca_size[7]),
+  CL6 = unlist(lca_size[9]),
+  CL7 = unlist(lca_size[11]))
+
+comparison_df <- comparison_df %>%
+  bind_rows(
+    data.frame(
+      set = rep("test", 300),
+      CL2 = unlist(lca_size[2]),
+      CL3 = unlist(lca_size[4]),
+      CL4 = unlist(lca_size[6]),
+      CL5 = unlist(lca_size[8]),
+      CL6 = unlist(lca_size[10]),
+      CL7 = unlist(lca_size[12])))
+
+cluster_compare <- comparison_df %>%
+  gather(key = "cluster", value = "value", -set) %>%
+  group_by(set, cluster, value) %>%
+  count() %>%
+  mutate(count = n,
+         clust_percent = ifelse(set == "train", n / 700, n / 300),
+         clust_percent = round(clust_percent, 4) * 100) %>%
+  ungroup() %>%
+  select(-n, -value) %>%
+  arrange(set, cluster, count)
+
+values <- cluster_compare %>%
+  select(-count) %>%
+  mutate(row_id = 1:n()) %>%
+  ungroup() %>% 
+  spread(key = "set", value = "clust_percent") %>%
+  select(-row_id) %>%
+  filter(is.na(train) == F)
+
+cluster_compare %>%
+  select(-count) %>%
+  mutate(row_id = 1:n()) %>%
+  ungroup() %>% 
+  spread(key = "set", value = "clust_percent") %>%
+  select(-row_id) %>%
+  filter(is.na(train) == T) %>%
+  select(-train) %>%
+  bind_cols(values) %>%
+  select(cluster, train, test) %>%
+  mutate(cluster = factor(cluster, levels = names(comparison_df)[2:7])) %>%
+  ggplot(aes(train, test)) +
+  geom_point(aes(colour = cluster), size = 5, alpha = .5, show.legend = F) +
+  geom_smooth(method = "lm", size = 1.3, se = F, colour = "dodgerblue") +
+  facet_wrap(facets = "cluster", scales = "free") +
+  labs(title = "Train and test LCA class size percentage comparison",
+       subtitle = "Both sets show very similiar class size proportions providing evidence that test LCA probability split is sound",
+       x = "training group percentages",
+       y = "testing group percentages",
+       caption = "Source: German Credit Data")
+```
+
+To begin the final model review, I'll develop a three class LCA object for both train and test. I'll use the training model as the main focus for the analysis but, will review the final test LCA for interpretation and stability as well.
+
+```{r LCA model development for 3 classes}
+set.seed(1017)
+train_lca3 <- poLCA(formula = lca_formula, data = training, nclass = 3,
+                       nrep = 10, tol = .001, verbose = FALSE)
+
+set.seed(1017)
+test_lca3 <- poLCA(formula = lca_formula, data = testing, nclass = 3,
+                  nrep = 10, tol = .001, verbose = FALSE, probs.start = train_lca3$probs)
+```
+
+The main focus here will be the inclusion probabilities for each variable level by class. These represent conditional probabilities of being assigned to a specific class based on the variable level. For example, if a customer has level 5 for occupation with a conditional probability of 85% for a specific class, it's possible that group has customers in management positions. These probabilities really separate LCA from clustering given it introduces a statistical element to the analysis. 
+
+With this in mind, below are the variable and class probabilities for the three LCA model. While the table is slightly busy, it's the first chance to assess which variable levels exemplify a certain class. 
+
+```{r four class LCA probability review}
+t(as.data.frame(train_lca3$probs)) %>% 
+  custom_kable()
+```
+
+Since the table is long, I've developed a faceted plot with all the classes, variables, and corresponding probabilities. I found this very helpful for getting a feel for what kind of customer was assigned to each class. Overall, I think the classes here are homogeneous but, still interpretable with defining features. There's a lot of variables to go over, so I've included a condensed series of insights for each class:
+
+#####Class 1
+
+- Skilled, single male, crucial account
+
+#####Class 2
+
+- Mixed gender, new jobs, management positions
+
+#####Class 3
+
+- Mixed gender, skilled, good credit history
+
+
+```{r four class LCA probability visualization, fig.width=10.5, fig.height=8}
+class_probs <- as.data.frame(train_lca3$probs) %>%
+  rownames_to_column(var = "class") %>%
+  gather(key = "variable", value = "probs", -class) %>%
+  arrange(class, variable) %>%
+  mutate(var_level = as.numeric(str_extract(variable, "[[:digit:]]+")),
+         class = gsub(pattern = "\\:", replacement = "", x = class),
+         variable = gsub(pattern = "\\.", replacement = "", x = variable),
+         variable = gsub(pattern = "Pr.*", replacement = "", x = variable))
+
+class_probs %>%
+  mutate(probs = round(probs, 2)) %>%
+  ggplot(aes(variable, var_level, size = probs, colour = probs)) +
+  geom_point() +
+  facet_wrap(facets = "class", nrow = 1) + 
+  coord_flip() +
+  scale_colour_gradient(low = "deepskyblue", high = "darkorange") +
+  guides(size = F) +
+    labs(title = "Class probability comparison plot for LCA model with three classes",
+         x = NULL,
+         y = "variable level",
+         caption = "Source: German Credit Data")
+```
+
+***
+
+###Perform Holdout Validation for selected LCA model
+
+I've already provided an ongoing validation using a train and test set for the models but, I'll include a review of the conditional class probabilities here. The previous section reviewed probabilities for the train set so I'll pivot to the test values here.
+
+One of the drawbacks of the method in R is that, despite setting a common seed, the train and test set class numbers don't necessarily align. In a previous section, I re-ordered the class probabilities to review stability but, once they've been assigned to a class, it's hard to do this. As such, it becomes a matching exercise to see if the train has a common partner in the test set even though they have a different class number. 
+
+Since the class numbers themselves don't have any intrinsic meaning, this is a reasonable approach. Here are the similar probability groups:
+
+- train 1 and test 3
+
+- train 3 and test 1
+
+- train 2 and test 2
+
+Overall, the probability comparison plot, while lacking some exact precision, is an efficient method for reviewing all the classes in concert. Training and test class 2 look the least similar.
+
+```{r test and train conditional probability review, fig.width=10.5, fig.height=8}
+test_probs <- as.data.frame(test_lca3$probs) %>%
+  rownames_to_column(var = "class") %>%
+  gather(key = "variable", value = "probs", -class) %>%
+  arrange(class, variable) %>%
+  mutate(set = "test",
+         var_level = as.numeric(str_extract(variable, "[[:digit:]]+")),
+         class = gsub(pattern = "\\:", replacement = "", x = class),
+         variable = gsub(pattern = "\\.", replacement = "", x = variable),
+         variable = gsub(pattern = "Pr.*", replacement = "", x = variable))
+
+class_probs %>%
+  mutate(set = "train") %>%
+  bind_rows(test_probs) %>%
+  mutate(set = factor(set, levels = c("train", "test"))) %>%
+  ggplot(aes(variable, var_level, size = probs, colour = probs)) +
+  geom_point() +
+  facet_grid(set ~ class) + 
+  coord_flip() +
+  scale_colour_gradient(low = "deepskyblue", high = "darkorange") +
+  guides(size = F) +
+  labs(title = "Train and test class probability comparison plot for LCA model with three classes",
+       x = NULL,
+       y = "variable level",
+       caption = "Source: German Credit Data")
+```
+
+By this point, I'm confident with the stability but, to add a final review, I'll take a look at class population shares. These are derived from taking the means of the posterior probabilities columns from the model. As seen below, both training and test are close, though not identical, which adds the final stability checkmark. 
+
+```{r posterior probability review}
+c(train_share = sort(colMeans(train_lca3$posterior)),
+  test_share = sort(colMeans(test_lca3$posterior))) %>%
+  custom_kable()
+```
+
+
+***
+
+###Provide commentary on stability, goodness of fit, interpretability, and solution adequacy
+
+I've tried to keep a running commentary throughout the analysis but, this is a good place to put my thoughts together. Having just finished the stability review, I'll reiterate that I think the training and test split produced sound models. While there were some differences in AIC, class proportions, and conditional probabilities, there were no major deviations. As such, I think the final approach here is stable.
+
+Moving onto goodness of fit, I think the class model is good. However, I would ideally like to see less homogeneous classes. Much of that is likely a function of the input data but, the conditional class probabilities were similar in some cases. Conversely though, I was still able to extract meaningful insights about each of the three classes. 
+
+To finalize this process, I've included the class names and size breakdown below. These would each have some unique value depending on the business need. For example, there is a that includes executives, a sought after customer group, which is desirable from a banking perspective. Each class segment could be formally engaged for special offers and banking products. 
+
+One tempering factor here are the class sizes associated with each named group. The original occupation bar chart showed 148 management figures. However, the class largely driven by high management figure numbers (three) has 420 customers. As such, there's obviously a mix of managers and workers with new jobs, which isn't necessarily a desirable mix from a customer segmentation perspective. 
+
+With that in mind, I have some reservations concerning the homogeneous conditional class probabilities combined with heterogeneous class compositions. Despite this, I still think each would have business utility making the LCA approach worthwhile here. Interpretation and business value are crucial to any analysis and they are still both evident here.
+
+```{r final class naming and size review}
+data.frame(
+  class = c(1:3),
+  class_name = c("Skilled, single males",
+                 "Mixed gender, skilled & good credit",
+                 "New jobs and management figures"),
+  class_size = as.vector(table(train_lca3$predclass)),
+  class_proportion = round(as.vector(prop.table(table(train_lca3$predclass))), 3)) %>%
+  custom_kable()
+```
+
+***
+
+###Comment on the similiarities or differences between LCA and K-means
+
+The most obvious differences I noticed stem from the divergent quantitative foundations of each method. This week, the class assignments were no longer definite but, supported by a conditional probability. What this means is that when a customer has a certain trait, like owning a home, their class membership is based on the variable level. This Bayesian approach iterates through each trait and assigns the customer to the class based on the largest conditional probability (i.e. the highest probability across a row for six classes). As such, the big takeaway here that LCA is a statistical method, which brings probabilities and gauged uncertainty to the clustering process.
+
+In contrast, the applied mathematical approach of k-means is more definitive. Cluster membership is assigned with no added uncertainty metric. The variant ko-means offers some flexibility but, the standard approach is more rigid than LCA. I think this might make the method less appealing to a data scientist who is well versed in the nuance of statistics. However, I think k-means is more intuitive given clusters can be defined using a series of group means. This is easier, and more business-friendly, to communicate because the method is more intuitive to a non-data science audience. Building on this, naming the three classes involved a careful review of 78 conditional probabilities, something that is not as accessible to general audience (and also more cumbersome during the analysis).
+
+All considered, both methods offer a similar end point, which is named market segments for business needs. The solutions I generated had three classes and six groups respectively but, with different focuses (owing to variable differences). While k-means is less flexible, it is more simplistic and benefits from easier interpretation. LCA offers a more measured, probabilistic approach but, does entail added complexity. Of course, each method targets different variable types so in many ways, they are complimentary and not adversarial. The main thing is that each provided sound grouping and business value as part of a wider analysis to segment German Credit banking customers.  
+
+***
