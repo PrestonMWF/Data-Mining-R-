@@ -1,0 +1,280 @@
+---
+title: "Clusterwise Regression with German Credit Data"
+author: "Mark Preston"
+date: "August 12, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+
+##Customer Creditability using German Credit Data and Clusterwise Regression
+
+I’ll be using the German Credit data to predict the amount a customer loan will be. Having done this in previous assignments, this analysis will use clusterwise regression as the prediction method. To use this method, I've loaded the appropriate clusterwise regression function.
+
+```{r loading data and packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(Metrics)
+library(knitr)
+library(kableExtra)
+
+#ggplot plotting theme preference
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+german_credit <- read.csv("German.Credit.csv")
+```
+
+```{r cluster function, echo=FALSE}
+clustreg=function(dat,k,tries,sed,niter){
+
+set.seed(sed)
+dat=as.data.frame(dat)
+rsq=rep(NA,niter)
+res=list()
+rsq.best=0
+    for(l in 1:tries) {
+
+	c = sample(1:k,nrow(dat),replace=TRUE)
+	yhat=rep(NA,nrow(dat))
+	for(i in 1:niter) {		
+		resid=pred=matrix(0,nrow(dat),k)
+		for(j in 1:k){	
+			pred[,j]=predict(glm(dat[c==j,],family="gaussian"),newdata=dat)		
+			resid[,j] = (pred[,j]-dat[,1])^2
+		}
+
+	c = apply(resid,1,fun.index.rowmin)
+	for(m in 1:nrow(dat)) {yhat[m]=pred[m,c[m]]}
+	rsq[i] = cor(dat[,1],yhat)^2	
+	#print(rsq[i])
+	}
+	
+	if(rsq[niter] > rsq.best) {	
+		rsq.best=rsq[niter]
+		l.best=l
+            c.best=c
+		yhat.best=yhat
+		}
+    }
+
+    for(i in k:1) res[[i]]=summary(lm(dat[c.best==i,]))
+	
+return(list(data=dat,nclust=k,tries=tries,seed=sed,rsq.best=rsq.best,number.loops=niter, Best.try=l.best,cluster=c.best,results=res))
+}
+
+fun.index.rowmin=function(x) {
+    
+    z=(1:length(x)) [x == min(x)]
+    if(length(z) > 1) { z=sample(z,1)}
+    return ( z ) }
+
+#prediction function for cwr
+clustreg.predict=function(results,newdat){
+
+	yhat=rep(NA,nrow(newdat))
+	resid=pred=matrix(0,nrow(newdat),length(table(results$cluster)))
+		
+		for(j in 1:length(table(results$cluster))){			
+			pred[,j]=predict(glm(results$data[results$cluster==j,],family="gaussian"),newdata=newdat)		
+			resid[,j] = (pred[,j]-newdat[,1])^2
+		}
+
+	c = apply(resid,1,fun.index.rowmin)
+	for(m in 1:nrow(newdat)) {yhat[m]=pred[m,c[m]]}
+	rsq = cor(newdat[,1],yhat)^2	
+
+return(list(results=results,newdata=newdat,cluster=c,yhat=yhat,rsq=rsq))
+
+}
+```
+
+***
+
+###Generate a training (70%) and hold out (30%) set using same seed at Logistic assignment
+
+As per the assignment, I'm dropping categorical variables while developing the training and holdout samples. This leaves six numeric features to predict credit amount with.
+
+```{r transformations and data split- same data as logistic}
+german_credit <- german_credit %>%
+  rename(Duration = Duration.of.Credit..month.,
+         Age = Age..years.,
+         Amount = Credit.Amount,
+         Rate = Instalment.per.cent,
+         Residence_Yrs = Duration.in.Current.address)
+
+german_credit <- german_credit %>%
+  select(Duration, Age, Amount, Rate, 
+         Residence_Yrs, No.of.Credits.at.this.Bank, No.of.dependents)
+
+set.seed(1017)
+data_split <- createDataPartition(y = german_credit$Amount, p = .7, list = F)
+
+training <- german_credit %>%
+  slice(data_split) %>%
+  select(Amount, everything())
+
+holdout <- german_credit %>%
+  slice(-data_split) %>%
+  select(Amount, everything())
+```
+
+***
+
+###Build clusterwise regression models with 1, 2, and 3 clusters
+
+I've developed a clusterwise model for one, two, and three clusters. With these, I'll be able to compare each model and select the most appropriate solution.
+
+```{r clusterwise model development}
+cwr_one <- clustreg(dat = training, k = 1, tries = 1, sed = 1017, niter = 1)
+
+cwr_two <- clustreg(dat = training, k = 2, tries = 2, sed = 1017, niter = 10)
+
+cwr_three <- clustreg(dat = training, k = 3, tries = 2, sed = 1017, niter = 10)
+```
+
+
+***
+
+###Explore the models using R2, interpretability, and holdout performance
+
+Starting here, I've plotted the best R2 form each of the three models. There is a large increase from one to two clusters (.50 to .82) but, the jump from two to three is less major (.82 to .89). Using this metric, it looks like the three cluster solution is preferable. That said, I think two might be a reasonable option depending on holdout performance and interpretability. However, I don't think one cluster is a good choice here.
+
+```{r r2 comparison}
+rsquare_compare <- data.frame(
+  set = "training",
+  model = factor(c("one", "two", "three"),
+                 levels = c("one", "two", "three")), 
+  R2 = c(cwr_one$rsq.best, cwr_two$rsq.best, cwr_three$rsq.best)
+)
+
+rsquare_compare %>%
+  ggplot(aes(model, R2, group = set)) +
+  geom_line(size = 1.4, colour = "dodgerblue2") +
+  scale_y_continuous(breaks = seq(0, 1, .05)) +
+  labs(title = "Clusterwise regression solutions- 3 clusters has highest R2 (.89)")
+```
+
+With this in mind, I'll focus on the regression summaries for both the two and three cluster models. The two summary shows several significant terms, including duration, rate, number of existing credits, and number of dependents. The interpretations all seem intuitive as well, for example the amount decreasing with rate increases and increasing as duration increases.
+
+
+```{r cwr two review}
+cwr_two$results
+```
+
+Interestingly, the significant coefficients change for the three cluster model with number of credits having a much higher p-value. However, the summary still seems interpretable and intuitive, which is a good sign.
+
+```{r cwr three review}
+cwr_three$results
+```
+
+Moving onto holdout performance, I've developed predictions for amount on the holdout set. These can be used to see how the models do on unseen data while also highlighting stability as well.
+
+```{r holdout performance}
+cwrone_pred <- clustreg.predict(results = cwr_one, newdat = holdout)
+
+cwrtwo_pred <- clustreg.predict(results = cwr_two, newdat = holdout)
+
+cwrthree_pred <- clustreg.predict(results = cwr_three, newdat = holdout)
+```
+
+The plot below highlights that the R2 drop from training to holdout is minimal for all three solutions. Again, this points to a three cluster solution being the most appropriate approach here.
+
+```{r rsquare comparison, warning=FALSE, message=FALSE}
+rsquare_compare <- data.frame(
+  set = "holdout",
+  model = factor(c("one", "two", "three"),
+                 levels = c("one", "two", "three")), 
+  R2 = c(cwrone_pred$rsq[1], cwrtwo_pred$rsq[1], cwrthree_pred$rsq[1])) %>%
+  bind_rows(rsquare_compare)
+
+rsquare_compare %>%
+  mutate(set = factor(set, levels = c("training", "holdout"))) %>%
+  ggplot(aes(model, R2, group = set, colour = set)) +
+  geom_line(size = 1.4) +
+  scale_y_continuous(breaks = seq(0, 1, .05)) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Clusterwise regression solutions for train and holdout- very small R2 drops show model stability")
+```
+
+Cluster size can be used to assess stability as well. For the two model, the cluster proportions from train to test are almost identical, which shows stability. 
+
+```{r cluster size comparison for two}
+c(train = prop.table(table(cwr_two$cluster)), 
+  test = prop.table(table(cwrtwo_pred$cluster))) %>%
+  custom_kable()
+```
+
+Building on this, the same finding is evident for the three cluster group. At this point, I'm strongly considering three as the preferred solution.
+
+```{r cluster size comparison for three}
+c(train = prop.table(table(cwr_three$cluster)), test = prop.table(table(cwrthree_pred$cluster))) %>%
+  custom_kable()
+```
+
+However, I still need to assess predictive performance. For this, I'll compare the holdout amount to the predicted values. I've decided against using one cluster so this review will only assess the two and three solutions.
+
+```{r predictions review}
+holdout <- holdout %>%
+  mutate(two_pred = cwrtwo_pred$yhat,
+         three_pred = cwrthree_pred$yhat)
+
+holdout %>%
+  select(Amount, two_pred, three_pred) %>%
+  head() %>%
+  custom_kable()
+```
+
+To formalize this, I'll use mean average percentage error (mape). As seen in the table below, the three cluster outperforms two with an average percentage miss of about 21%.
+
+```{r mape compare}
+c(two_mape = mape(actual = holdout$Amount, predicted = holdout$two_pred),
+  three_mape = mape(actual = holdout$Amount, predicted = holdout$three_pred)) %>%
+  custom_kable()
+```
+
+Given the review, I think the three cluster model is the best solution here. As a final visual, I've plotted the actuals and the predicted values for the solution. The clusterwise model shows some differences from the actuals but, the fit isn't too bad. The results would need to be reviewed with business stakeholders to ascertain if the predictions were valuable for the bank. 
+
+```{r predictions plot}
+holdout %>%
+  select(Amount, three_pred) %>%
+  gather(key = "variable", value = "values") %>%
+  ggplot(aes(values, colour = variable, fill = variable)) +
+  geom_density(size = 1.3, alpha = .1) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Predicted vs actuals for three cluster solution (mape = 21.4%)",
+       x = "Amount")
+```
+
+As a final review, I wanted to look at the averages for each variable by cluster to better understand their composition. The clusters seem homogeneous across most variables with the exception of amount. Given this, it appears that the clusters form a high, medium, and low amount clustering solution.
+
+```{r cluster review}
+holdout %>%
+  select(-two_pred, -three_pred) %>%
+  mutate(cluster = cwrthree_pred$cluster) %>%
+  group_by(cluster) %>%
+  summarise(avg_amount = mean(Amount),
+            avg_duration = mean(Duration),
+            avg_age = mean(Age),
+            avg_rate = mean(Rate),
+            avg_residence = mean(Residence_Yrs),
+            avg_credits = mean(No.of.Credits.at.this.Bank),
+            avg_credits = mean(No.of.dependents)) %>%
+  custom_kable()
+```
+
+
+***
+
