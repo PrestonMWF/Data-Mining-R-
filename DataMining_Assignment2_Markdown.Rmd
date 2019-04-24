@@ -1,0 +1,777 @@
+---
+title: 'Data Mining Principles Assignment #2'
+author: "Mark Preston"
+date: "July 8, 2018"
+output: 
+  html_document: 
+    fig_height: 7
+    fig_width: 10
+---
+
+***
+
+##German Credit Customer Segmentation
+
+Using the German Credit data set from the `caret` package, I'll be conducting a market segmentation exercise using cluster analysis. Specifically, the analysis will use both k and ko-means to perform customer segmentation. To start, I'm loading the necessary data and packages.
+
+```{r package and data load, warning=FALSE, message=FALSE}
+library(caret)
+library(tidyverse)
+library(reshape2)
+library(knitr)
+library(kableExtra)
+
+#ggplot plotting theme preference
+theme_set(
+  theme_bw()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+data("GermanCredit")
+```
+
+
+***
+
+
+###Select all the variables that are appropriate and useful
+
+K-means only works with numeric variables given the method is rooted in linear algebra. Given this, only numeric variables can be considered for the analysis. Further, this set has a lot of dummy variables (i.e. categorical variables split into columns with a 1 or 0 signifying a particular level) which will not be considered either. This leaves seven variables to choose from as seen below. 
+
+After consulting the data dictionary, I'm dropping NumberPeopleMaintenance because it will hinder the cluster interpretability. This analysis would be for a business audience and the variable meaning and relevance isn't very clear so I'm removing it. There isn't a quantitative approach to K-means variable selection so I'm developing it with a focus on model interpretability for a business audience here.
+
+```{r variable selection}
+data.frame(type = sapply(GermanCredit, typeof)) %>%
+  rownames_to_column(var = "variable") %>%
+  filter(type == "integer" & variable != "Class") %>%
+  custom_kable()
+```
+
+Following this, there are 6 variables left, all of which will be used in the k-means analysis. I'm making a specific set for these variables below.
+
+```{r creating clustering set}
+clustering_set <- GermanCredit %>%
+  select(Duration, Age, Amount, InstallmentRatePercentage, 
+         ResidenceDuration, NumberExistingCredits)
+
+head(clustering_set, 6) %>%
+  custom_kable()
+```
+
+It's always a good idea to visualize and review tables highlighting each variable distribution before moving into the formal clustering. This promotes a more thorough data understanding and, given clustering will work with some mix of these variable means, is the first glance at what each variable mean looks like.
+
+As seen, these customers have an average age of around 35, indicating a more mature banking group. The mean and median difference highlights that the distribution has some positive skew though, so there is still a younger cohort. The credit amounts are similarly positively skewed, though to a much larger degree. This seems to indicate credit amounts are generally small but, there with some larger amounts skewing the distribution.
+
+```{r variable means review}
+visual_df <- clustering_set %>%
+  gather(key = "variable")
+
+variable_mean <- visual_df %>%
+  group_by(variable) %>%
+  summarise(mean = mean(value),
+            median = median(value),
+            sd = sd(value))
+
+variable_mean %>%
+  custom_kable()
+```
+
+The plot shows that there's a mix of count and continuous values. In fact, the bottom row reveals numeric variables that are more akin to binned, ordinal features. That said, I'm going to include all three because rate and credits would be important to a financial institution from a business perspective and residence duration adds a complimentary feature to age. This might be useful for determining a segment like young and mobile versus middle-aged and residence established.
+
+From a business perspective, the credits being reviewed don't tend to be overly large with a max at around €19,000 (although no units are given, I'm assuming it's Euros). This was revealed in the table but, the plot shows where they max out which confirms the previous thinking. Overall, this seems to be a customer base just before middle-age taking on lower credit amounts with few existing credits. The credit has installment rates from 1% to 4%, with most around 3%, and duration averages at around 20 months (about a year and half).
+
+```{r visualizing clustering variables}
+visual_df %>%
+  ggplot(aes(value, fill = variable)) +
+  geom_histogram(bins = 33, show.legend = F) +
+  geom_vline(data = variable_mean, aes(xintercept = mean),
+             alpha = .4, size = 1.3 , colour = "dodgerblue2") +
+  facet_wrap(facets = "variable", scales = "free") +
+  labs(title = "Clustering data for German Credit customer segmentation- includes only numeric variables",
+       subtitle = "Variable means (blue lines) included for reference",
+       y = NULL,
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+There's a strong case here for scaling the data set given Amount is a much larger scale than the other five variables. Since Euclidean distance, which is the primary metric for measuring similarity in K-means, is heavily influenced by larger numbers, so subtracting variable means and converting each value to a z-score makes sense. While this is not essential, it ensures that the resulting clusters are not dominated by credit amount. This process is captured below using the `scale` function. I've also redeveloped the previous plot to provide visual evidence of the scaling process.
+
+```{r scaling clustering set}
+scaled_clustering <- as.data.frame(scale(clustering_set, center = T, scale = T))
+
+scaled_visual <- scaled_clustering %>%
+  gather(key = "variable")
+
+scaled_mean <- scaled_visual %>%
+  group_by(variable) %>%
+  summarise(mean = mean(value))
+
+scaled_visual %>%
+  ggplot(aes(value, fill = variable)) +
+  geom_histogram(bins = 33, show.legend = F) +
+  geom_vline(data = scaled_mean, aes(xintercept = mean),
+             alpha = .4, size = 1.3 , colour = "dodgerblue2") +
+  facet_wrap(facets = "variable", scales = "free") +
+  labs(title = "Scaled clustering data for German Credit customer segmentation- includes only numeric variables",
+       subtitle = "Variable means (blue lines) included for reference- all are zero following transformation",
+       y = NULL,
+       x = NULL,
+       caption = "Source: German Credit Data")
+```
+
+
+***
+
+
+###Generate K-Means Solution and present Variance-Account-For (VAF)
+
+Before conducting the k-means clustering, I've split the data into a training and test set so the analysis can be verified using a hold out sample. This is done by using the mean centres from the training set to develop the test set clusters and then, comparing the results for consistency.
+
+```{r train and test split}
+set.seed(1017)
+data_split <- sample(x = nrow(scaled_clustering), size = 650, replace = F)
+
+training <- scaled_clustering %>%
+  slice(data_split)
+
+testing <- scaled_clustering %>%
+  slice(-data_split)
+```
+
+To do this comparison efficiently, I've developed a function that clusters both a training and test set for a given number of k (i.e. the number of clusters being returned). The function further returns values for VAF as well as cluster sizes for each training and test.  
+
+```{r k-means extraction function}
+cluster_collect <- function(return, training_data, test_data, cluster_n, n_start, seed){
+  set.seed(seed = seed)
+  train_cluster <- kmeans(training_data, centers = cluster_n, nstart = n_start)
+  test_cluster <- kmeans(test_data, centers = train_cluster$centers, nstart = n_start)
+  
+  vaf <- data.frame(cluster = cluster_n,
+             train_VAF = 1 - train_cluster$tot.withinss / train_cluster$totss,
+             test_VAF = 1 - test_cluster$tot.withinss / test_cluster$totss) %>%
+    mutate(total_diff = round(test_VAF - train_VAF, 3),
+           percent_diff = round(total_diff / train_VAF * 100, 3))
+  
+  train_size <- train_cluster$cluster
+  test_size <- test_cluster$cluster
+  
+  if (return == "vaf") {return(vaf)}
+  if (return == "test") {return(test_size)}
+  if (return == "train") {return(train_size)}
+  if (return != "vaf" | return != "test" | return != "train") {
+    stop("Value specified is not part of function- Call one of vaf, train, or test")}
+}
+```
+
+Using the `cluster_collect` function in conjunction with `sapply`, I've put together a data frame with all the VAF values for clusters ranging from 2 to 10 k with training and test sets. The VAF values are similar for both training and test. The largest percentage difference is for the 2 k cluster. However, the values seem to be stable overall, which is a good sign that the training group provides sound cluster options. 
+
+This is the first chance to develop an intuition on how many clusters should be selected. Though a scree plot will provide a better option for this, it looks like between four to six clusters might be reasonable.
+
+```{r train and test vaf comparison}
+vaf_compare <- as.data.frame(
+  t(sapply(2:10, function(x) cluster_collect(seed = 1017,
+                                             return = "vaf",
+                                             training_data = training, 
+                                             test_data = testing,
+                                             cluster_n = x, 
+                                             n_start = 100))))
+
+vaf_compare <- as.data.frame(apply(vaf_compare, 2, as.numeric))
+
+vaf_compare %>%
+  custom_kable()
+```
+
+
+***
+
+
+###Perform scree tests and plot results to choose the appropriate number of k-means clusters
+
+The scree plot confirms my previous intuition concerning the preferred cluster size. It looks like anywhere between four and six groups would be reasonable. Before making a final decision though, I'll also review cluster size for stability. Here, the idea is to see if both the training and test sets have similar size compositions.
+
+```{r scree plot for training and test clusters}
+vaf_compare %>%
+  select(-total_diff, -percent_diff) %>%
+  gather(key = data_set, value = vaf, train_VAF:test_VAF) %>%
+  mutate(data_set = factor(data_set, levels = c("train_VAF", "test_VAF"))) %>%
+  ggplot(aes(cluster, vaf, colour = data_set)) +
+  geom_line(size = 1.3) +
+  scale_y_continuous(breaks = seq(0, 1, .05)) +
+  scale_x_continuous(breaks = seq(2, 10, 1)) +
+  geom_vline(xintercept = 4, alpha = .3, colour = "blueviolet", size = 1.3) +
+  geom_vline(xintercept = 6, alpha = .3, colour = "blueviolet", size = 1.3) +
+  annotate("rect", xmin = 4, xmax = 6,
+           ymin = .15, ymax = .65, 
+           alpha = .1, fill = "blueviolet") +
+  scale_color_manual(values = c("royalblue2", "darkorange")) +
+  labs(title = "Variance Accounted For (VAF) Screeplot for training and test clusters",
+       subtitle = "Training and test remain close providing assurance that cluster groups are reasonable; Selecting 4 to 6 clusters seems appropriate",
+       y = "VAF")
+```
+
+
+***
+
+
+###Choose one clustering solution to retain
+
+As mentioned, the training and test cluster sizes need to be reviewed to ensure they are similar and thus, stable. Using the `cluster_collect` function, I've put together a data frame with the cluster sizes for both groups. It includes the cluster groupings, a marker for which set the record emanates from, and principle component analysis (PCA) factor scores for factor one (PCA1) and factor two (PCA2) which will be used to visualize the clusters.
+
+```{r developing data frame for train and test cluster size comparison}
+comparison_df <- as.data.frame(sapply(1:10, function(x) cluster_collect(seed = 1017,
+                                                            return = "train",
+                                                            training_data = training, 
+                                                            test_data = testing,
+                                                            cluster_n = x, 
+                                                            n_start = 100))) %>%
+  mutate(data_set = "training", 
+         F1_scores = princomp(training)$scores[,1],
+         F2_scores = princomp(training)$scores[,2]) %>%
+  select(data_set, F1_scores, F2_scores, everything()) %>%
+  select(-V1)
+
+comparison_df <- comparison_df %>%
+  bind_rows(
+    as.data.frame(sapply(1:10, function(x) cluster_collect(seed = 1017,
+                                                           return = "test",
+                                                           training_data = training,
+                                                           test_data = testing,
+                                                           cluster_n = x,
+                                                           n_start = 100))) %>%
+  mutate(data_set = "testing", 
+         F1_scores = princomp(testing)$scores[,1] * -1,
+         F2_scores = princomp(testing)$scores[,2] * -1) %>%
+  select(data_set, F1_scores, F2_scores, everything()) %>%
+  select(-V1)
+)
+
+names(comparison_df) <- gsub(pattern = "V", replacement = "CL", 
+                             x = names(comparison_df))
+
+head(comparison_df, 6) %>%
+  custom_kable()
+```
+
+Following this, I developed a second data frame with the cluster group percentages as well. This ensures that the percentages for train and test can be visualized in a scatter plot. Additionally, it means that every group can be reviewed at once using a faceted visual.
+
+```{r developing data frame for train and test cluster size comparison 2}
+cluster_compare <- comparison_df %>%
+  gather(key = "cluster", value = "value", -data_set, -F1_scores, -F2_scores) %>%
+  group_by(data_set, cluster, value) %>%
+  count() %>%
+  mutate(count = n,
+         clust_percent = ifelse(data_set == "training", n / 650, n / 350),
+         clust_percent = round(clust_percent, 4) * 100) %>%
+  ungroup() %>%
+  select(-n, -value)
+
+head(cluster_compare, 6) %>%
+  custom_kable()
+```
+
+Before the plotting though, I've included a look at clusters 2 and 3. The table highlights that the groups look proportional to one another, save for some small differences. This is another good indication that the clusters are stable between train and test.  
+
+```{r cluster group size comparison}
+cluster_compare %>%
+  filter(cluster == "CL2" | cluster == "CL3") %>%
+  arrange(cluster) %>%
+  custom_kable()
+```
+
+Visualizing the group percentages further confirms the group size remain stable between train and test. Regression lines help highlight the strong correlation between each set's group percentages.
+
+```{r cluster group size comparison plot}
+values <- cluster_compare %>%
+  select(-count) %>%
+  mutate(row_id = 1:n()) %>%
+  ungroup() %>% 
+  spread(key = "data_set", value = "clust_percent") %>%
+  select(-row_id) %>%
+  filter(is.na(training) == F)
+
+cluster_compare %>%
+  select(-count) %>%
+  mutate(row_id = 1:n()) %>%
+  ungroup() %>% 
+  spread(key = "data_set", value = "clust_percent") %>%
+  select(-row_id) %>%
+  filter(is.na(training) == T) %>%
+  select(-training) %>%
+  bind_cols(values) %>%
+  select(cluster, training, testing) %>%
+  mutate(cluster = factor(cluster, levels = names(comparison_df)[4:12])) %>%
+  ggplot(aes(training, testing)) +
+  geom_point(aes(colour = cluster), size = 5, alpha = .5, show.legend = F) +
+  geom_smooth(method = "lm", size = 1.3, se = F, colour = "dodgerblue") +
+  facet_wrap(facets = "cluster", scales = "free") +
+  labs(title = "Train and test cluster group size percentage comparison",
+       subtitle = "Both sets show very similiar group size proportions providing evidence that test clustering split is sound",
+       x = "training group percentages",
+       y = "testing group percentages",
+       caption = "Source: German Credit Data")
+```
+
+It's fairly clear the groups are stable at this point but, I've also included a plot visualizing each cluster set using PCA. Since the original clustering set has more than two variables, it's not well suited for visualization. However, I've used PCA for dimensional reduction so each group can be plotted using factor scores (PCA 2 vs PCA 1). Each point, representing a single customer, is then coloured with the appropriate cluster group. As seen, the train and test groups look very similar, which is a good final stability check.
+
+This is also the first opportunity to see how the various cluster groups interact within a specific k. For example, cluster 3 has three very distinct groups with minimal overlap, which indicates that these customer segments would be fairly unique. Past group three, the segments start getting more condensed and overlapping, which is reasonable given there's only 650 or 350 customers depending on the set. 
+
+```{r pca cluster visualization, fig.height=8}
+comparison_df %>%
+  gather(key = "cluster", value = "value", -data_set, -F1_scores, -F2_scores) %>%
+  mutate(data_set = factor(data_set, levels = c("training", "testing")), 
+         value = as.factor(value),
+         cluster = factor(cluster, levels = names(comparison_df)[4:12])) %>%
+  ggplot(aes(F1_scores, F2_scores, colour = value)) +
+  geom_jitter(alpha = .5) +
+  facet_grid(cluster ~ data_set, scales = "free") +
+  labs(title = "Train and test cluster groups visualized using PCA",
+       subtitle = "Both sets show very similiar group size and shape providing further evidence that test clustering split is sound",
+       x = "PCA 1",
+       y = "PCA 2",
+       caption = "Source: German Credit Data")
+```
+
+The group overlap and interpretability are important here given I'm aiming for interpretable clusters that would be intuitive for a business audience. Cluster four seems to be more well defined with groups four and two being fairly distinct while groups one and three seem mixed and therefore similar. Cluster six is much busier and specific groups intermingle, though group two does seem separate. These insights are good to carry forward for the final selection process, which will include a formal mean comparison for each cluster set. 
+
+```{r pca cluster visualization for 4 and 6}
+comparison_df %>%
+  gather(key = "cluster", value = "value", -data_set, -F1_scores, -F2_scores) %>%
+  mutate(value = as.factor(value)) %>%
+  filter(cluster == "CL4" | cluster == "CL6") %>%
+  ggplot(aes(F1_scores, F2_scores, colour = value)) +
+  geom_jitter(size = 2, alpha = .4) +
+  facet_grid(cluster ~ data_set, scales = "free") +
+  labs(title = "Train and test cluster groups visualized using PCA- Focus on Clusters 4 and 6",
+       subtitle = "Both sets show very similiar group size and shape providing further evidence that test clustering split is sound",
+       x = "PCA 1",
+       y = "PCA 2",
+       caption = "Source: German Credit Data")
+```
+
+To do the mean comparison, I've created a k-means object for both four and six clusters. The groups have the same composition as the ones derived using `cluster_collect` because I've used a common seed when developing the objects so they match the compositions from `cluster_collect` earlier.
+
+```{r cluster means comparison}
+set.seed(1017)
+four_segments <- kmeans(training, centers = 4, nstart = 100)
+six_segments <- kmeans(training, centers = 6, nstart = 100)
+```
+
+At a glance, both groups have clear interpretability and can be used for segmentation naming. There's enough distinction in the sixth cluster that clear differences are evident between groups. As such, I'm going to pick the six cluster group because it has a higher VAF (.42 vs .52, or about 24% more variance accounted for) without sacrificing interpretability. I will say the four cluster groups were more distinct and homogeneous though, as seen on the PCA plot, so there is some trade off here. 
+
+I'll provide a more comprehensive mean review for the six cluster when I formally name the segments in a later section.
+
+```{r cluster four mean review}
+as.data.frame(four_segments$centers) %>%
+  mutate(Cluster = rep(4, 4),
+         Group = 1:4) %>%
+  select(Cluster, Group, everything()) %>%
+  bind_rows(
+    as.data.frame(six_segments$centers) %>%
+      mutate(Cluster = rep(6, 6),
+             Group = 1:6) %>%
+      select(Cluster, Group, everything())) %>%
+  custom_kable()
+```
+
+
+***
+
+
+###Generate KO-means
+
+I've loaded in the `komeans` functions and will be generating cluster for 3 to 6 groups.
+
+```{r ko_means generation, echo=FALSE}
+fun.okc.2 <- function (data = data, nclust = nclust, lnorm = lnorm, tolerance = tolerance) 
+{
+  M = nrow(data)
+  N = ncol(data)
+  K = nclust
+  niterations = 50
+  #    datanorm = apply(data, 2, fun.normalize)
+  datanorm = scale(data)
+  S = matrix(sample(c(0, 1), M * K, replace = TRUE), M, K)
+  S = cbind(S, rep(1, M))
+  W = matrix(runif(N * K), K, N)
+  W = rbind(W, rep(0, N))
+  sse = rep(0, niterations)
+  oprevse = exp(70)
+  opercentse = 1
+  i = 1
+  while ((i <= niterations) & (opercentse > tolerance)) {
+    for (k in 1:K) {
+      sminusk = S[, -k]
+      wminusk = W[-k, ]
+      s = as.matrix(S[, k])
+      w = t(as.matrix(W[k, ]))
+      dstar = datanorm - sminusk %*% wminusk
+      prevse = exp(70)
+      percentse = 1
+      l = 1
+      while ((l <= niterations) & (percentse > tolerance)) {
+        for (m in 1:N) {
+          if (lnorm == 2) {
+            w[1, m] = mean(dstar[s == 1, m], na.rm = TRUE)
+          }
+          if (lnorm == 1) {
+            w[1, m] = median(dstar[s == 1, m], na.rm = TRUE)
+          }
+        }
+        for (m in 1:M) {
+          if (lnorm == 2) {
+            ss1 = sum((dstar[m, ] - w[1, ])^2, na.rm = TRUE)
+            ss0 = sum((dstar[m, ])^2, na.rm = TRUE)
+          }
+          if (lnorm == 1) {
+            ss1 = sum(abs(dstar[m, ] - w[1, ]), na.rm = TRUE)
+            ss0 = sum(abs(dstar[m, ]), na.rm = TRUE)
+          }
+          if (ss1 <= ss0) {
+            s[m, 1] = 1
+          }
+          if (ss1 > ss0) {
+            s[m, 1] = 0
+          }
+        }
+        if (sum(s) == 0) {
+          s[sample(1:length(s), 2)] = 1
+        }
+        if (lnorm == 2) {
+          se = sum((dstar - s %*% w)^2, na.rm = TRUE)
+        }
+        if (lnorm == 1) {
+          se = sum(abs(dstar - s %*% w), na.rm = TRUE)
+        }
+        percentse = 1 - se/prevse
+        prevse = se
+        l = l + 1
+      }
+      S[, k] = as.vector(s)
+      W[k, ] = as.vector(w)
+    }
+    if (lnorm == 2) 
+      sse[i] = sum((datanorm - S %*% W)^2, na.rm = TRUE)/sum((datanorm - 
+                                                                mean(datanorm, na.rm = TRUE))^2, na.rm = TRUE)
+    if (lnorm == 1) 
+      sse[i] = sum(abs(datanorm - S %*% W), na.rm = TRUE)/sum(abs(datanorm - 
+                                                                    median(datanorm, na.rm = TRUE)), na.rm = TRUE)
+    if (lnorm == 2) {
+      ose = sum((datanorm - S %*% W)^2, na.rm = TRUE)
+    }
+    if (lnorm == 1) {
+      ose = sum(abs(datanorm - S %*% W), na.rm = TRUE)
+    }
+    opercentse = (oprevse - ose)/oprevse
+    oprevse = ose
+    i = i + 1
+  }
+  if (lnorm == 2) 
+    vaf = cor(as.vector(datanorm), as.vector(S %*% W), use = "complete.obs")^2
+  if (lnorm == 1) 
+    vaf = 1 - sse[i - 1]
+  rrr = list(Data = data, Normalized.Data = datanorm, Tolerance = tolerance, 
+             Groups = S[, 1:K], Centroids = round(W[1:K, ], 2), SSE.Percent = sse[1:i - 
+                                                                                    1], VAF = vaf)
+  
+  
+  return(rrr)
+}
+
+komeans <- function (data_ = data, nclust_ = nclust, lnorm_ = lnorm, nloops_ = nloops, tolerance_ = tolerance, seed_ = seed) 
+{
+  prevsse = 100
+  set.seed(seed_)
+  for (i in 1:nloops_) {
+    z = fun.okc.2(data = data_, nclust = nclust_, lnorm = lnorm_, 
+                  tolerance = tolerance_)
+    if (z$SSE.Percent[length(z$SSE.Percent[z$SSE.Percent >  0])] < prevsse) {
+      prevsse = z$SSE.Percent[length(z$SSE.Percent[z$SSE.Percent >  0])]
+      ind = i
+      z.old = z
+    }
+  }
+  return(list(data = z.old$Data, Normalized.Data = z.old$Normalized.Data, 
+              Group = z.old$Group %*% as.matrix(2^(0:(nclust_-1)) ), Centroids = z.old$Centroids, Tolerance = z.old$Tolerance, 
+              SSE.Pecent = z.old$SSE.Percent, VAF = z.old$VAF, iteration = ind, 
+              seed = seed_))
+}
+```
+
+
+```{r komeans development, cache=TRUE}
+komeans_three <- komeans(data_ = training, nclust_ = 3, lnorm_ = 2,
+                         nloops_ = 100, seed_ = 1017, tolerance_ = 0.001)
+
+komeans_four <- komeans(data_ = training, nclust_ = 4, lnorm_ = 2,
+                         nloops_ = 100, seed_ = 1017, tolerance_ = 0.001)
+
+komeans_five <- komeans(data_ = training, nclust_ = 5, lnorm_ = 2,
+                         nloops_ = 100, seed_ = 1017, tolerance_ = 0.001)
+
+komeans_six <- komeans(data_ = training, nclust_ = 6, lnorm_ = 2,
+                         nloops_ = 100, seed_ = 1017, tolerance_ = 0.001)
+```
+
+
+***
+
+
+###Compare k-means and komeans solutions from an interpretability standpoint
+
+When comparing both clustering methods, I'm looking to determine which is more interpretable. Looking at the centres first, both options are similarly straightforward to interpret (though the means are slightly different, which is expected). This method relies on using the centroids from the `komeans` function. I'll also include a more manual method but, before that, I'll need to do a group size comparison first.
+
+```{r centre comparison}
+as.data.frame(six_segments$centers) %>%
+  mutate(Method = "K-M",
+         Group = 1:6) %>%
+  rename(V1 = Duration,
+       V2 = Age,
+       V3 = Amount,
+       V4 = InstallmentRatePercentage,
+       V5 = ResidenceDuration,
+       V6 = NumberExistingCredits) %>%
+  select(Method, Group, everything()) %>%
+  bind_rows(
+    as.data.frame(komeans_six$Centroids) %>%
+  mutate(Method = "K-MO",
+         Group = 1:6) %>%
+  select(Method, Group, everything())) %>%
+  arrange(Group) %>%
+  custom_kable()
+```
+
+One area where k-means seems more interpretable is group size. Most of that stems from having to deal with many fewer groups (6 vs 61). The numerous groups are a feature of the method allowing records to have membership in more than one group. For a set this size, the groups also become very small when using ko-means making each that much harder to ascribe business meaning to. Given this, I think k-means is preferable in this case despite having less flexibility as a method overall.
+
+As a methodological note, I've truncated the ko-means table to the bottom ten rows for space considerations. Additionally, the ko-means group numbers do not include 28 and start at zero so the 63rd group is technically the 61st. However, this does not affect the analysis in any way.
+
+```{r group size comparison}
+komeans_size <- as.data.frame(table(komeans_six$Group)) %>%
+  rename("cluster_group" = "Var1")
+
+komeans_size  %>%
+  slice(52:61) %>%
+  custom_kable()
+```
+
+With the group sizes established now, I'll move onto a second means comparison using a manual method. The idea here is to take the six most populous ko-means groups, which are essentially markers for clusters with the most information, and compare the variable means to the k-means method centres. As seen below, I've picked out the top six groups by size.
+
+```{r top 6 cluster size}
+komeans_size %>%
+  arrange(desc(Freq)) %>%
+  slice(1:6) %>%
+  custom_kable()
+```
+
+With the top six confirmed, I've made a new data frame with the original training set but, with the ko-means cluster membership added. Here, I can filter out the top six cluster numbers and then take each variable mean across all groups. After this, I've restructured the data to long form and derived the means using `group_by` for the clusters and training variable. Finally, I've then added in the six cluster means for comparison, which is the final table. The ko-means mean values are just as interpretable, though they seem to have a large negative value skew (7 over zero, 29 below). That said, the values themselves seem reasonable and are still interpretable with clear segment characteristics. One drawback though is key variables, like Amount, seem to be similar and therefore, don't offer enough of a compelling business narrative for the segments.
+
+```{r manual means comparison}
+mean_comparison <- training %>%
+  mutate(ko_cluster = as.vector(komeans_six$Group)) %>%
+  filter(ko_cluster %in% c(9, 41, 3, 33, 57, 1))
+
+mean_comparison <- melt(data = mean_comparison, id.vars = "ko_cluster")
+
+levels <- c("Duration", "Age", "Amount", "InstallmentRatePercentage",
+            "ResidenceDuration", "NumberExistingCredits")
+
+mean_comparison %>%
+  group_by(ko_cluster, variable) %>%
+  summarise(ko_means = mean(value)) %>%
+  ungroup() %>%
+  mutate(variable = factor(variable, levels = levels),
+         k_means = as.vector(six_segments$centers),
+         km_cluster = rep(1:6, each = 6)) %>%
+  arrange(variable) %>%
+  select(ko_cluster, km_cluster, everything()) %>%
+  custom_kable()
+```
+
+The final point of comparison here is VAF, which again is, not surprisingly, very interpretable. The ko-means has a much higher VAF at .75. This is likely a product of being a more flexible method. All things equal, it's preferable to have more variance explained when comparing the models (assuming both have been selected from the appropriate place in the scree plot) so ko-means is more reasonable here.
+
+```{r vaf comparison}
+c(kmeans_vaf = vaf_compare$train_VAF[vaf_compare$cluster == 6],
+  komeans_vaf = komeans_six$VAF) %>%
+  custom_kable()
+```
+
+Overall though, I still think k-means seems more interpretable and meaningful in this instance. With fewer groups to work with, and less manual work to derive the means, the method is more intuitive while offering better ease of understanding. I could see ko-means being preferable in a much larger clustering exercise where interpretability was less important but here, I'm siding with the more simplistic method, which still does a good segmentation job.
+
+
+***
+
+
+###Interpret the final cluster segments and summarize results
+
+I've added some details on cluster interpretation so far but, have yet to do a robust analysis of the means. Working with the six cluster model, I'll try to name each group using the centres from the `kmeans` object. During this, I'll ascribe some wider business interpretation to the groups and name them based on their means.
+
+```{r final six clustering}
+set.seed(1017)
+six_segments <- kmeans(training, centers = 6, nstart = 100)
+```
+
+To start, I've visualized the means across all the cluster groups. The line plot is slightly over saturated but, it's a good first view of all the means. In fact the saturated lines further confirms the PCA findings, namely that the groups are not homogeneous. The PCA cluster plot showed group two as the most distinct which is evident here as well. Group two has the highest credit amount and longest duration and is thus visually striking with these two high peaks.
+
+At a high level, some key insights emerge here. Group six is the oldest segment by a large margin; it also has high residence duration pointing to older, more settled customers. Group three seems to have the lowest rate percent and duration, though it's similar in many ways to other groups.
+
+```{r six means visualization}
+six_means <- as.data.frame(six_segments$centers) %>%
+  mutate(Group = 1:6) %>%
+  select(Group, everything())
+
+six_means %>%
+  rename("Rate Percent" = "InstallmentRatePercentage") %>%
+  gather(key = "variable", value = "means", -Group) %>%
+  mutate(Group = as.factor(Group)) %>%
+  ggplot(aes(variable, means, colour = Group, group = Group)) +
+  geom_line(size = 1.3, alpha = .3) +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray", alpha = .5) +
+  scale_y_continuous(breaks = seq(-2, 2, .5)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Variable means by group for six cluster k-means model",
+     subtitle = "Plot highlights variable means by cluster group; For example, group 6 has largest mean Age signalling older customer segment",
+     y = "group means",
+     x = NULL,
+     caption = "Source: German Credit Data")
+```
+
+To gain further insights, I've developed a facet plot where each line has an independent graph area but, variables are still on the same plane for comparison. This makes it easier to pick out each groups mean attributes. Group one has the lowest residence duration and a lower age accompanied by high rates. Group five has high rates while group four has the highest credits. These insights help with some preliminary naming ideas which I'll formalize going forward.
+
+```{r six means facet visualization}
+six_means %>%
+  rename("Rate Percent" = "InstallmentRatePercentage",
+         "Credits" = "NumberExistingCredits") %>%
+  gather(key = "variable", value = "means", -Group) %>%
+  mutate(Group = as.factor(Group)) %>%
+  ggplot(aes(variable, means, colour = Group, group = Group)) +
+  geom_line(size = 1.3, show.legend = F) +
+  geom_hline(yintercept = 0, size = 1.3, alpha = .5, colour = "darkgray") +
+  facet_wrap(facets = "Group", nrow = 1) +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1)) +
+  scale_y_continuous(breaks = seq(-2, 2, .5)) +
+  labs(title = "Faceted lines plot for variable means by group for six cluster k-means model",
+   subtitle = "Plot highlights variable means by cluster group; For example, group 6 has largest mean Age signalling older customer segment",
+   y = "group means",
+   x = NULL,
+   caption = "Source: German Credit Data")
+```
+
+To do so, while also putting all these insights in one place, I've constructed a means table with unscaled values. This helps with interpretation, which would be crucial for a business audience, by transforming the means back into their original units.
+
+Here are some high level insights for each group:
+
+#####Group 1:
+
+- High rate percentage
+
+- Lowest residence duration
+
+- Second youngest group
+
+#####Group 2:
+
+- Longest duration by wide margin (around 2 SD)
+
+- Largest credit amount by wide margin (around 2 SD)
+
+- Most unique group from PCA (likely owing to the points above)
+
+#####Group 3:
+
+- Lowest duration
+
+- Youngest segment
+
+- Lowest rate percentage
+
+- All means below zero
+
+#####Group 4:
+
+- Highest existing credits
+
+- Low credit amount
+
+- High rate percentage
+
+#####Group 5:
+
+- Lowest amount
+
+- Highest rate percentage
+
+- Highest residence duration
+
+#####Group 6:
+
+- Highest age
+
+- High residence duration
+
+- Low duration
+
+```{r unscaled mean review}
+six_means %>%
+  mutate(Group = 1:6,
+         Duration = six_means$Duration * variable_mean$sd[[3]] + variable_mean$mean[[3]],
+         Age = six_means$Age * variable_mean$sd[[1]] + variable_mean$mean[[1]],
+         Amount = six_means$Amount * variable_mean$sd[[2]] + variable_mean$mean[[2]],
+         InstallmentRatePercentage = six_means$InstallmentRatePercentage * variable_mean$sd[[4]] + variable_mean$mean[[4]],
+         ResidenceDuration = six_means$ResidenceDuration * variable_mean$sd[[6]] + variable_mean$mean[[6]],
+         NumberExistingCredits = six_means$NumberExistingCredits * variable_mean$sd[[5]] + variable_mean$mean[[5]]) %>%
+  select(Group, everything()) %>%
+  custom_kable()
+```
+
+Given theses insights, I've come up with appropriate customer segment descriptions below. The names are comprised of the major mean features from each group. Alongside this, I've also included the cluster sizes and their relative percentages for the whole set. While not perfectly even, all the segments have a good number of customers in them. This is good to see from a business application standpoint because it provides a ready number of customers to engage for various bank activities if needed (e.g. targeted incentives for a new house renovation credit line for group six).
+
+```{r six cluster mean final naming}
+data.frame(
+  cluster_group = c("One", "Two", "Three", "Four", "Five", "Six"),
+  segment_name = c("Young & mobile with high rate",
+                             "High amount & long term",
+                             "Young with short-term & good rate",
+                             "Low amount, high rate with existing credit",
+                             "Stable resident with high rate & low amount",
+                             "Older with short-term & stable residence"),
+  table(six_segments$cluster)) %>%
+  mutate(segment_percent = round(Freq / 650, 4) * 100) %>%
+  rename(segment_size = Freq) %>%
+  select(-Var1) %>%
+  custom_kable()
+```
+
+The analysis provides six interpretable clusters which could be used for business needs. While the groups show overlap, there are enough unique and salient features that each group could be used for a specific bank activity, such as marketing or sales targeting. As a final methodological note, once the training and test have been confirmed and the final model has been selected, the entire data set would be clustered and not just the train data. For consistency, I used the training set throughout and for the final analysis but, I would likely use the whole data set if the modelling approach was being implemented.
+
+
+***
+
+
+###Segment recruitment approach for Attitudinal and Usage study
+
+This questions asks for the following:
+
+- What approach would you take to recruit prospective study participants over the phone? Assume consumers will be reimbursed for focus group or AU survey.
+
+- Which consumers will you try and recruit?
+
+- How will you identify if a recruit belongs to particular segment?
+
+####Know your business need
+
+From the outset, the recruitment has to be operationalized with a practical view of what the study or focus group is going to cover. For example, if a new banking product is being launched for older, more mature customers, this helps frame the recruitment approach. I'll work under this mock example. Additionally, I'll answer in reverse order working under the assumption their is an ideal participant in mind:
+
+- Consult internal customer database and query for specific age characteristics. This would be used to confirm that the bank had access to potential participants. If this were not available, I would look to acquire a data set with consumer demographic information and general characteristics (along with contact details).
+
+- Using a query, I would pull a large, randomized data set with the variables used in the analysis. The size of the set would be informed by how many participants I would need. For example, if there's only a 10% acceptance rate for phone recruitment and I required 100 people, the set would need to include at least several thousand records. I would then conduct a clustering exercise using the model I already developed. Just like the train and test portion of the analysis, the existing cluster means could be used on a new, unseen set. From there, I would filter the set leaving only customers from group six (Older with short-term & stable residence). Putting the cluster analysis into active use would form the basis of my identification and recruitment approach. 
+
+- From there, I would randomly sample from the new set and phone participants to seek their participation in the study while informing them of the reimbursements. Providing some form of monetary compensation or banking product incentive would be the main tactic for gathering participants. Although this introduces a convenience and availability bias to the approach, it's practically difficult to recruit study participants without some added incentive. Another crucial detail here is what the study is seeking. For example, a randomized, causal study would be designed differently than a general descriptive one. I would take these design considerations into account as well.
+
+
+***
+
