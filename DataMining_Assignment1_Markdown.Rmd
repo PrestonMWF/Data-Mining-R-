@@ -1,0 +1,246 @@
+---
+title: "Regression on multiple train and test"
+author: "Mark Preston"
+date: "August 9, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Predicting German Credit Amount Regression
+
+for this assignment, I'll be building a regression model to predict the amount of credit a customer will take on. Additionally, this will be conducted on numerous samples to highlight the changing nature of the regression model on different data. The training data I'm using relies on only numeric features.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(caret)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+data("GermanCredit")
+
+training_data <- GermanCredit %>%
+  select(Amount, Duration, Age, InstallmentRatePercentage, 
+         ResidenceDuration, NumberExistingCredits)
+```
+
+***
+
+###Building regression model to predict amount. Repeat process 1000 times.
+
+To ensure I can build a regression model and capture its coefficients over different samples, I've developed a helper function to that streamlines the process. `Model_sampler` runs a train and test regression on a new sample from the original data and then saves the results into a data frame. Here, I've also developed a second data frame with the confidence intervals for the model coefficients as well.
+
+```{r developing model sampling function}
+model_sampler <- function(df_return){
+    data_split <- createDataPartition(y = training_data$Amount, 
+                                    p = .632, 
+                                    list = F)
+  
+    train <- training_data[data_split,]
+    test <- training_data[-data_split,]
+    
+    train_lm <- lm(Amount ~ ., data = train)
+    
+    model_summary <- data.frame(
+      t(coef(train_lm)),
+      R_squared = summary(train_lm)$r.squared,
+      Holdout_R2 = cor(test$Amount, predict(train_lm, newdata = test)) ^ 2) %>%
+      mutate(R2_percent_change = round((R_squared - Holdout_R2) / R_squared * 100, 3))%>%
+      rename(Intercept = X.Intercept.)
+    
+    confidence_int <- as.data.frame(confint(train_lm)) %>%
+      rownames_to_column(var = "Variable")
+    
+    if (df_return == "confint"){
+      return(confidence_int)
+    } else if (df_return == "model") {
+      return(model_summary)
+    }
+}
+
+set.seed(1017)
+lm_samples <- as.data.frame(
+  do.call(rbind, replicate(1000, model_sampler(df_return = "model"),
+                           simplify = F))) %>%
+  mutate(Sample = seq(training_data$Amount)) %>%
+  select(Sample, everything())
+
+set.seed(1017)
+confidence_ints <- as.data.frame(
+  do.call(rbind, replicate(1000, model_sampler(df_return = "confint"),
+                           simplify = F))) %>%
+  mutate(Sample = rep(seq(training_data$Amount), each = 6)) %>%
+  select(Sample, everything())
+```
+
+***
+
+###Plot the model coefficients
+
+Using this repeated sampling method, it's possible to see the distribution of the model coefficients. This helps illuminate how stable and consistent the model is on new data. As seen, the coefficient histograms for age, duration, and the intercept are generally normal but, do vary widely. This is especially true for the intercept. The histograms highlight that different data do produce a very different model coefficients. Overall though, despite different values the coefficients seems stable, given the normal distribution. This really highlights that the model creation process is heavily influenced by sample composition.
+
+```{r plotting model coefficients}
+lm_samples %>%
+  select(Intercept, Age, Duration) %>%
+  gather(key = "coefficient", value = "values") %>%
+  ggplot(aes(values, fill = coefficient)) +
+  geom_histogram(bins = 35, show.legend = F) +
+  facet_wrap(facets = "coefficient", scales = "free") +
+  labs(title = "Model coefficients for Age, Duration, and Intercept- Distributions seem normal and stable")
+```
+
+Aside from the beta coefficients, the model's training and holdout R2 can be reviewed in the same fashion. The distributions suggest that the average training R2 for this model is about .5 whereas the holdout R2 mean is about .49. With this in mind, the percent change mean of .59 makes sense. However, there are some extreme changes, namely some models where there is over 40% difference. I think it's positive to see the stability of having both R2 metrics so closely aligned, save for the tails cases (where there even seem to be cases where holdout is higher than train). I was again hoping to see a normal distribution so this is a good sign. 
+
+Overall, the R2 is slightly lower than I would want but, considering I've only used numeric features, it isn't too bad. I would elect to add more categorical features to see how they change but, given I'm mostly focused on reviewing the coefficient changes, this is sufficient.
+
+```{r plotting R2 metrics}
+lm_samples %>%
+  select(R_squared, Holdout_R2, R2_percent_change) %>%
+  gather(key = "coefficient", value = "values") %>%
+  mutate(coefficient = factor(coefficient, 
+                              levels = c("R_squared", 
+                                         "Holdout_R2", 
+                                         "R2_percent_change"))) %>%
+  ggplot(aes(values, fill = coefficient)) +
+  geom_histogram(bins = 35, show.legend = F) +
+  facet_wrap(facets = "coefficient", scales = "free") +
+  labs(title = "Model coefficients for Train R2, Holdout R2, and R2 change- Distributions seem normal and stable")
+```
+
+***
+
+###Compute both the mean and standard deviation for each beta coefficient 
+
+I alluded to some of the means in the previous section but, I've formalized that work here. The coefficient means provide insight into what might be expected from the average model when predicting amount. For example, duration has a positive association with amount with an average increase of 152$ per unit of added time (months here). Additionally, the average installment percentage coefficient signals a strong negative association with amount decreasing with rate increases.
+
+```{r beta coefficient means}
+lm_samples %>%
+  select(-Sample, -R2_percent_change, -R_squared, -Holdout_R2) %>%
+  map_df(mean) %>%
+  custom_kable()
+```
+
+The coefficient standard deviations provide insight into how dispersed the beta values are across the sampled model. As seen, the intercept has the largest standard deviation while age has the lowest.
+
+```{r beta coefficient sd}
+lm_samples %>%
+  select(-Sample, -R2_percent_change, -R_squared, -Holdout_R2) %>%
+  map_df(sd) %>%
+  custom_kable()
+```
+
+***
+
+###Sample and full model comparisons
+
+In this section, I'll compare the full model coefficients to the samples. Additionally, I'll include a review of the confidence intervals as well. I've started by developing a regression model on the full banking sample.
+
+```{r developing full model}
+full_lm <- lm(Amount ~., data = training_data)
+```
+
+To start, I've put together a table with the sample coefficient means compared to the full model. As seen, all the values are very similar, with the exception of residence duration. This essentially means that the full model is about average and doesn't contain any of the extreme values from any of the coefficient distributions. 
+
+```{r mean comparison between models}
+mean_comparison <- data.frame(
+  samples = colMeans(lm_samples[,2:7]),
+  full_model = coef(full_lm))
+
+mean_comparison %>%
+  rownames_to_column(var = "variable") %>%
+  mutate(difference = round(samples - full_model, 3),
+         perc_diff = round(difference / full_model * 100, 3)) %>%
+  custom_kable()
+```
+
+Since the percentage difference looks stark for residence duration, I wanted to check where 4.05 fell on the sampling distribution. Looking at it from this perspective, the value is still very close to the mean so the percentage difference is probably okay. The large percentage difference is also driven in part by the coefficients being small to begin with.
+
+```{r residence duration histogram}
+lm_samples %>%
+  ggplot(aes(ResidenceDuration)) +
+  geom_histogram(bins = 35, fill = "dodgerblue2") +
+  geom_vline(xintercept = mean_comparison$full_model[5], 
+             colour = "darkorange", size = 1.3) +
+  scale_x_continuous(breaks = seq(-150, 150, 25)) +
+  labs(title = "Full model coefficient for residence duration (orange line) still very close to mean (well under 1 SD)")
+```
+
+Moving onto the confidence intervals, I've started by getting the lower and upper bounds for the full model. Following this, I created a new variables to measure the difference between the confidence bounds (confidence interval width). This will be used to assess whether the full model or samples have narrower or broader intervals.
+
+```{r confidence intervals for full model}
+full_confint <- as.data.frame(confint(full_lm)) %>%
+  rownames_to_column(var = "variable") %>%
+  mutate(ci_width = `97.5 %` - `2.5 %`)
+
+full_confint %>%
+  custom_kable()
+```
+
+I've put together a table with all the confidence intervals so they can be reviewed at once. As seen, all the intervals show a fairly even split with more being broader as a general rule. This result is reasonable since I was expecting the full model to be about average, something that seemed to make sense following the coefficient review. One thousand samples is enough to get a representative spread for the confidence intervals so it was my expectation that they would be about evenly split between tighter and broader when compared to the full model. 
+
+```{r intercept ci width}
+int <- confidence_ints %>%
+  filter(Variable == "(Intercept)") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[1], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+duration <- confidence_ints %>%
+  filter(Variable == "Duration") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[2], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+age <- confidence_ints %>%
+  filter(Variable == "Age") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[3], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+rate <- confidence_ints %>%
+  filter(Variable == "InstallmentRatePercentage") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[4], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+residence <- confidence_ints %>%
+  filter(Variable == "ResidenceDuration") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[5], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+credits <- confidence_ints %>%
+  filter(Variable == "NumberExistingCredits") %>%
+  mutate(ci_width = (`97.5 %` - `2.5 %`) * sqrt(.632),
+         ci_compare = ifelse(ci_width < full_confint$ci_width[6], 
+                             "tighter", "broader")) %>%
+  count(ci_compare)
+
+bind_rows(int, duration, age, rate, residence, credits) %>%
+  mutate(variable = c(rep("Intercept", 2), 
+                      rep(names(training_data)[2:6], each = 2))) %>%
+  select(variable, everything()) %>%
+  custom_kable()
+```
+
+Overall, this sampling approach to linear regression highlighted that developing numerous models helps frame expectations for what might change given a data sample. When comparing the coefficients and intervals to the full model, the results showed how it was more or less average. This sampling model building helps highlight the stability of a model and is very useful for situating any final model built with a full set.   
+
+***
